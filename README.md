@@ -1,2 +1,2 @@
-# Tiny Systems Example module
-Example module for the Tiny Systems platform.
+# Tiny Systems HTTP module
+HTTP clients and servers
