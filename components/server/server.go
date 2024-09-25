@@ -184,9 +184,6 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 	}
 	h.startContext = msg.Context
 
-	if err := h.stop(); err != nil {
-		return err
-	}
 	h.runLock.Lock()
 	defer h.runLock.Unlock()
 
@@ -398,7 +395,7 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 	_ = h.client.DisclosePort(discloseCtx, actualLocalPort)
 
 	// send status when we stopped
-	_ = h.sendStatus(ctx, msg.Context, handler)
+	_ = h.sendStatus(discloseCtx, msg.Context, handler)
 	// ask to reconcile (redraw the component)
 
 	return h.startErr.Load()
