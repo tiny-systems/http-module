@@ -20,7 +20,7 @@ func (c ContentType) JSONSchema() (jsonschema.Schema, error) {
 	contentType.AddType(jsonschema.String)
 	contentType.WithTitle("Content Type").
 		WithDefault(200).
-		WithEnum(MIMEApplicationJSON, MIMEApplicationXML, MIMETextHTML, MimeTextPlain).
+		WithEnum(MIMEApplicationJSON, MIMEApplicationXML, MIMETextHTML, MimeTextPlain, "").
 		WithDefault(MIMEApplicationJSON).
 		WithDescription("Content type of the response")
 	return contentType, nil
