@@ -134,14 +134,12 @@ type Status struct {
 	IsRunning  bool         `json:"isRunning" title:"Is running" readonly:"true"`
 }
 
-type ResponseBody any
-
 type Response struct {
 	RequestID   string          `json:"requestID" required:"true" title:"Request ID" minLength:"1" description:"To match response with request pass request ID to response port"`
 	StatusCode  int             `json:"statusCode" required:"true" title:"Status Code" description:"HTTP status code for response" minimum:"100" default:"200" maximum:"599"`
 	ContentType etc.ContentType `json:"contentType" required:"true"`
 	Headers     []etc.Header    `json:"headers,omitempty"  title:"Response headers"`
-	Body        ResponseBody    `json:"body" title:"Response body" configurable:"true"`
+	Body        string          `json:"body" title:"Response body"`
 }
 
 func (h *Component) GetInfo() module.ComponentInfo {
@@ -287,18 +285,10 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 					for _, header := range resp.Headers {
 						c.Response().Header().Set(header.Key, header.Value)
 					}
-					switch resp.ContentType {
-					case etc.MIMEApplicationXML:
-						c.XML(resp.StatusCode, resp.Body)
-					case etc.MIMEApplicationJSON:
-						c.JSON(resp.StatusCode, resp.Body)
-					case etc.MIMETextHTML:
-						c.HTML(resp.StatusCode, fmt.Sprintf("%v", resp.Body))
-					case etc.MimeTextPlain:
-						c.String(resp.StatusCode, fmt.Sprintf("%v", resp.Body))
-					default:
-						c.String(resp.StatusCode, fmt.Sprintf("%v", resp.Body))
+					if resp.ContentType != "" {
+						c.Response().Header().Set("Content-Type", string(resp.ContentType))
 					}
+					_ = c.String(resp.StatusCode, fmt.Sprintf("%v", resp.Body))
 					return
 				}
 			}
