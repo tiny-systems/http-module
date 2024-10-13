@@ -134,6 +134,6 @@ require (
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
 
-replace github.com/tiny-systems/module => ../../module
+//replace github.com/tiny-systems/module => ../../module
 
 replace github.com/spyzhov/ajson v0.9.4 => github.com/tiny-systems/ajson v0.1.3
