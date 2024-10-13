@@ -139,7 +139,7 @@ type Response struct {
 	StatusCode  int             `json:"statusCode" required:"true" title:"Status Code" description:"HTTP status code for response" minimum:"100" default:"200" maximum:"599"`
 	ContentType etc.ContentType `json:"contentType" required:"true"`
 	Headers     []etc.Header    `json:"headers,omitempty"  title:"Response headers"`
-	Body        string          `json:"body" title:"Response body"`
+	Body        string          `json:"body" title:"Response body" format:"textarea"`
 }
 
 func (h *Component) GetInfo() module.ComponentInfo {
