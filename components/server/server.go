@@ -359,10 +359,9 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 
 			publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, msg.Hostnames, tcpAddr.Port)
 			if err != nil {
-				h.setPublicListerAddr([]string{fmt.Sprintf("http://localhost:%d", tcpAddr.Port)})
-			} else {
-				h.setPublicListerAddr(publicURLs)
+				return err
 			}
+			h.setPublicListerAddr(publicURLs)
 		}
 	}
 
