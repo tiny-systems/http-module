@@ -6,6 +6,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	_ "github.com/tiny-systems/http-module/components/basicauth/header-parser"
 	_ "github.com/tiny-systems/http-module/components/client"
 	_ "github.com/tiny-systems/http-module/components/server"
 	"github.com/tiny-systems/module/cli"
