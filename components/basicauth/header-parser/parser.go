@@ -20,7 +20,7 @@ type Context any
 
 type InMessage struct {
 	Context Context      `json:"context" configurable:"true" required:"true" title:"Context" description:"Arbitrary message to be send further"`
-	Headers []etc.Header `json:"headers" required:"true" description:"HTTP headers list"`
+	Headers []etc.Header `json:"headers" required:"true" title:"Headers" description:"HTTP headers list"`
 }
 
 type OutMessage struct {
