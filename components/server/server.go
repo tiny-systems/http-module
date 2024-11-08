@@ -52,8 +52,7 @@ type Component struct {
 
 	runLock *sync.Mutex
 
-	startContext StartContext
-	startErr     *atomic.Error
+	startErr *atomic.Error
 	//
 	node v1alpha1.TinyNode
 
@@ -87,8 +86,8 @@ func (h *Component) Instance() module.Component {
 
 type Settings struct {
 	EnableStatusPort bool `json:"enableStatusPort" required:"true" title:"Enable status port" description:"Status port notifies when server is up or down"`
-	EnableStopPort   bool `json:"enableStopPort" required:"true" title:"Enable stop port" description:"Stop port allows you to stop the server"`
-	EnableStartPort  bool `json:"enableStartPort" required:"true" title:"Enable start port" description:"Start port allows you to start the server"`
+	EnableStopPort   bool `json:"enableStopPort" required:"true" title:"Enable stop port" description:"Stop port allows you to stop server"`
+	EnableStartPort  bool `json:"enableStartPort" required:"true" title:"Enable start port" description:"Start port allows you to start server"`
 }
 
 type StartContext any
@@ -175,12 +174,11 @@ func (h *Component) isRunning() bool {
 	return h.cancelFunc != nil
 }
 
-func (h *Component) start(ctx context.Context, msg Start, handler module.Handler) error {
+func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	//
 	if h.client == nil {
 		return fmt.Errorf("unable to start, no client available")
 	}
-	h.startContext = msg.Context
 
 	h.runLock.Lock()
 	defer h.runLock.Unlock()
@@ -189,12 +187,11 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 	e.HideBanner = false
 	e.HidePort = false
 
-	//h.e = e
+	serverCtx, serverCancel := context.WithCancel(ctx)
+	defer serverCancel()
 
-	serverCtx, cancel := context.WithCancel(ctx)
-
-	h.setCancelFunc(cancel)
-	h.contexts = ttlmap.New(ctx, msg.ReadTimeout*2)
+	h.setCancelFunc(serverCancel)
+	h.contexts = ttlmap.New(ctx, h.startSettings.ReadTimeout*2)
 
 	e.Any("*", func(c echo.Context) error {
 		id, err := uuid.NewUUID()
@@ -204,7 +201,7 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 
 		idStr := id.String()
 		requestResult := Request{
-			Context:       msg.Context,
+			Context:       h.startSettings.Context,
 			RequestID:     idStr,
 			Host:          c.Request().Host,
 			Method:        c.Request().Method,
@@ -277,7 +274,7 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 				case <-ctx.Done():
 					return
 
-				case <-time.Tick(time.Duration(msg.ReadTimeout) * time.Second):
+				case <-time.Tick(time.Duration(h.startSettings.ReadTimeout) * time.Second):
 					c.Error(fmt.Errorf("read timeout"))
 					return
 
@@ -301,8 +298,8 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 		return nil
 	})
 
-	e.Server.ReadTimeout = time.Duration(msg.ReadTimeout) * time.Second
-	e.Server.WriteTimeout = time.Duration(msg.WriteTimeout) * time.Second
+	e.Server.ReadTimeout = time.Duration(h.startSettings.ReadTimeout) * time.Second
+	e.Server.WriteTimeout = time.Duration(h.startSettings.WriteTimeout) * time.Second
 
 	var (
 		listenPort      int
@@ -313,8 +310,8 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 		listenPort = annotationPort
 	}
 
-	if len(msg.Hostnames) == 1 {
-		portParts := strings.Split(msg.Hostnames[0], ":")
+	if len(h.startSettings.Hostnames) == 1 {
+		portParts := strings.Split(h.startSettings.Hostnames[0], ":")
 		if len(portParts) == 2 {
 			// we have single hostname defined with explicit port defined, try parse it and use it
 			if port, err := strconv.Atoi(portParts[1]); err == nil {
@@ -345,19 +342,19 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 
 			actualLocalPort = tcpAddr.Port
 			//
-			exposeCtx, cancel := context.WithTimeout(ctx, time.Second*30)
-			defer cancel()
+			exposeCtx, exposeCancel := context.WithTimeout(ctx, time.Second*30)
+			defer exposeCancel()
 
 			// upgrade
 			// hostname it's a last part of the node name
 			var autoHostName string
 
-			if msg.AutoHostName {
+			if h.startSettings.AutoHostName {
 				autoHostNameParts := strings.Split(h.node.Name, ".")
 				autoHostName = autoHostNameParts[len(autoHostNameParts)-1]
 			}
 
-			publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, msg.Hostnames, tcpAddr.Port)
+			publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
 			if err != nil {
 				return err
 			}
@@ -366,7 +363,7 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 	}
 
 	// send status that we run
-	_ = h.sendStatus(ctx, msg.Context, handler)
+	_ = h.sendStatus(ctx, h.startSettings.Context, handler)
 	// ask to reconcile (redraw the component)
 
 	<-serverCtx.Done()
@@ -378,13 +375,13 @@ func (h *Component) start(ctx context.Context, msg Start, handler module.Handler
 	h.setCancelFunc(nil)
 
 	//
-	discloseCtx, cancel := context.WithTimeout(context.Background(), time.Second*30)
-	defer cancel()
+	discloseCtx, discloseCancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer discloseCancel()
 
 	_ = h.client.DisclosePort(discloseCtx, actualLocalPort)
 
 	// send status when we stopped
-	_ = h.sendStatus(discloseCtx, msg.Context, handler)
+	_ = h.sendStatus(discloseCtx, h.startSettings.Context, handler)
 	// ask to reconcile (redraw the component)
 
 	return h.startErr.Load()
@@ -418,7 +415,7 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 		switch msg.(type) {
 		case StartControl:
-			return h.start(ctx, h.startSettings, handler)
+			return h.start(ctx, handler)
 
 		case StopControl:
 			return h.stop()
@@ -439,8 +436,9 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		if !ok {
 			return fmt.Errorf("invalid start message")
 		}
-		// give time to fail
-		return h.start(ctx, in, handler)
+
+		h.startSettings = in
+		return h.start(ctx, handler)
 
 	case StopPort:
 		return h.stop()
