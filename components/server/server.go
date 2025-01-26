@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/clbanning/mxj/v2"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/tiny-systems/http-module/components/etc"
@@ -109,7 +108,7 @@ type Request struct {
 	Method        string       `json:"method" required:"true" title:"Method" enum:"GET,POST,PATCH,PUT,DELETE" enumTitles:"GET,POST,PATCH,PUT,DELETE"`
 	RealIP        string       `json:"realIP"`
 	Headers       []etc.Header `json:"headers,omitempty"`
-	Body          any          `json:"body"`
+	Body          string       `json:"body"`
 	Scheme        string       `json:"scheme"`
 }
 
@@ -227,36 +226,8 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 			}
 		}
 
-		cType := req.Header.Get(etc.HeaderContentType)
-		switch {
-		case strings.HasPrefix(cType, etc.MIMEApplicationJSON):
-			if err = c.Echo().JSONSerializer.Deserialize(c, &requestResult.Body); err != nil {
-				var HTTPError *echo.HTTPError
-				switch {
-				case errors.As(err, &HTTPError):
-					return err
-				default:
-					return echo.NewHTTPError(http.StatusBadRequest, err.Error()).SetInternal(err)
-				}
-			}
-		case strings.HasPrefix(cType, etc.MIMEApplicationXML), strings.HasPrefix(cType, etc.MIMETextXML):
-			mxj.SetAttrPrefix("")
-			m, err := mxj.NewMapXmlReader(req.Body, false)
-			if err != nil {
-				return echo.NewHTTPError(http.StatusBadRequest, err.Error()).SetInternal(err)
-			}
-			requestResult.Body = m.Old()
-
-		case strings.HasPrefix(cType, etc.MIMEApplicationForm), strings.HasPrefix(cType, etc.MIMEMultipartForm):
-			params, err := c.FormParams()
-			if err != nil {
-				return echo.NewHTTPError(http.StatusBadRequest, err.Error()).SetInternal(err)
-			}
-			requestResult.Body = params
-		default:
-			body, _ := io.ReadAll(req.Body)
-			requestResult.Body = utils.BytesToString(body)
-		}
+		body, _ := io.ReadAll(req.Body)
+		requestResult.Body = utils.BytesToString(body)
 
 		ch := make(chan Response)
 		h.contexts.Put(idStr, ch)
@@ -283,7 +254,7 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 						c.Response().Header().Set(header.Key, header.Value)
 					}
 					if resp.ContentType != "" {
-						c.Response().Header().Set("Content-Type", string(resp.ContentType))
+						c.Response().Header().Set(etc.HeaderContentType, string(resp.ContentType))
 					}
 					_ = c.String(resp.StatusCode, fmt.Sprintf("%v", resp.Body))
 					return
@@ -356,7 +327,8 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 
 			publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
 			if err != nil {
-				return err
+				//fallback to localhost for development purposes
+				publicURLs = []string{fmt.Sprintf("http://localhost:%d", tcpAddr.Port)}
 			}
 			h.setPublicListerAddr(publicURLs)
 		}
