@@ -11,7 +11,7 @@ require (
 	github.com/spf13/viper v1.19.0
 	github.com/spyzhov/ajson v0.9.4
 	github.com/swaggest/jsonschema-go v0.3.70
-	github.com/tiny-systems/module v0.1.135
+	github.com/tiny-systems/module v0.1.136
 	go.uber.org/atomic v1.11.0
 )
 
