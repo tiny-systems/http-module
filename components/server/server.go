@@ -7,7 +7,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/tiny-systems/http-module/components/etc"
-	"github.com/tiny-systems/http-module/pkg/ttlmap"
 	"github.com/tiny-systems/http-module/pkg/utils"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
@@ -40,7 +39,8 @@ type Component struct {
 	//
 	startSettings Start
 	//
-	contexts *ttlmap.TTLMap
+	contexts    map[string]chan Response
+	contextLock *sync.RWMutex
 
 	publicListenAddrLock *sync.Mutex
 	publicListenAddr     []string
@@ -190,8 +190,10 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	defer serverCancel()
 
 	h.setCancelFunc(serverCancel)
-	h.contexts = ttlmap.New(ctx, h.startSettings.ReadTimeout*2)
 
+	h.contexts = make(map[string]chan Response)
+	h.contextLock = &sync.RWMutex{}
+	//
 	e.Any("*", func(c echo.Context) error {
 		id, err := uuid.NewUUID()
 		if err != nil {
@@ -230,8 +232,22 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 		requestResult.Body = utils.BytesToString(body)
 
 		ch := make(chan Response)
-		h.contexts.Put(idStr, ch)
-		defer close(ch)
+
+		//h.contexts.Put(idStr, ch)
+
+		h.contextLock.Lock()
+		h.contexts[idStr] = ch
+		h.contextLock.Unlock()
+
+		defer func() {
+			// deregister first
+			h.contextLock.Lock()
+			defer h.contextLock.Unlock()
+
+			delete(h.contexts, idStr)
+			// close ch
+			close(ch)
+		}()
 
 		doneCh := make(chan struct{})
 		go func() {
@@ -425,15 +441,14 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			return fmt.Errorf("unknown request ID %s", in.RequestID)
 		}
 
-		ch := h.contexts.Get(in.RequestID)
+		h.contextLock.RLock()
+		ch := h.contexts[in.RequestID]
+		h.contextLock.RUnlock()
+
 		if ch == nil {
 			return fmt.Errorf("context '%s' not found", in.RequestID)
 		}
-
-		if respChannel, ok := ch.(chan Response); ok {
-			h.contexts.Delete(in.RequestID)
-			respChannel <- in
-		}
+		ch <- in
 
 	default:
 		return fmt.Errorf("port %s is not supported", port)
