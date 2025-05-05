@@ -86,7 +86,6 @@ func (h *Component) Instance() module.Component {
 type Settings struct {
 	EnableStatusPort bool `json:"enableStatusPort" required:"true" title:"Enable status port" description:"Status port notifies when server is up or down"`
 	EnableStopPort   bool `json:"enableStopPort" required:"true" title:"Enable stop port" description:"Stop port allows you to stop server"`
-	EnableStartPort  bool `json:"enableStartPort" required:"true" title:"Enable start port" description:"Start port allows you to start server"`
 }
 
 type StartContext any
@@ -112,13 +111,7 @@ type Request struct {
 	Scheme        string       `json:"scheme"`
 }
 
-type StartControl struct {
-	Status string `json:"status" title:"Status" readonly:"true"`
-	Start  bool   `json:"start" format:"button" title:"Start" required:"true" description:"Start HTTP server"`
-}
-
-type StopControl struct {
-	Stop       bool     `json:"stop" format:"button" title:"Stop" required:"true" description:"Stop HTTP server"`
+type Control struct {
 	Status     string   `json:"status" title:"Status" readonly:"true"`
 	ListenAddr []string `json:"listenAddr" title:"Listen Address" readonly:"true"`
 }
@@ -128,8 +121,8 @@ type Stop struct {
 
 type Status struct {
 	Context    StartContext `json:"context" title:"Context"`
-	ListenAddr []string     `json:"listenAddr" title:"Listen Address" readonly:"true"`
-	IsRunning  bool         `json:"isRunning" title:"Is running" readonly:"true"`
+	ListenAddr []string     `json:"listenAddr" title:"Listen Address"`
+	IsRunning  bool         `json:"isRunning" title:"Is running"`
 }
 
 type Response struct {
@@ -343,7 +336,6 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 
 			publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
 			if err != nil {
-				//fallback to localhost for development purposes
 				publicURLs = []string{fmt.Sprintf("http://localhost:%d", tcpAddr.Port)}
 			}
 			h.setPublicListerAddr(publicURLs)
@@ -396,18 +388,7 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 	case module.ClientPort:
 		h.client, _ = msg.(module.Client)
 
-	case module.ControlPort:
-		if msg == nil {
-			break
-		}
-
-		switch msg.(type) {
-		case StartControl:
-			return h.start(ctx, handler)
-
-		case StopControl:
-			return h.stop()
-		}
+		return h.stop()
 
 	case module.SettingsPort:
 		in, ok := msg.(Settings)
@@ -459,12 +440,12 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 func (h *Component) getControl() interface{} {
 	if h.isRunning() {
-		return StopControl{
+		return Control{
 			Status:     "Running",
 			ListenAddr: h.getPublicListerAddr(),
 		}
 	}
-	return StartControl{
+	return Control{
 		Status: "Not running",
 	}
 }
@@ -509,16 +490,13 @@ func (h *Component) Ports() []module.Port {
 		},
 	}
 
-	if h.settings.EnableStartPort {
-
-		ports = append(ports, module.Port{
-			Name:          StartPort,
-			Label:         "Start",
-			Source:        true,
-			Position:      module.Left,
-			Configuration: h.startSettings,
-		})
-	}
+	ports = append(ports, module.Port{
+		Name:          StartPort,
+		Label:         "Start",
+		Source:        true,
+		Position:      module.Left,
+		Configuration: h.startSettings,
+	})
 
 	// programmatically stop server
 	if h.settings.EnableStopPort {
