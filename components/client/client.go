@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/tiny-systems/http-module/components/etc"
+	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
 	"github.com/tiny-systems/module/registry"
 	"io"
@@ -73,10 +74,10 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	}
 }
 
-func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) error {
+func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
 
 	switch port {
-	case module.SettingsPort:
+	case v1alpha1.SettingsPort:
 		// compile template
 		in, ok := msg.(Settings)
 		if !ok {
@@ -111,7 +112,9 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() {
+			_ = resp.Body.Close()
+		}()
 
 		b, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -166,9 +169,8 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 func (h *Component) Ports() []module.Port {
 	ports := []module.Port{
 		{
-			Name:   RequestPort,
-			Label:  "Request",
-			Source: true,
+			Name:  RequestPort,
+			Label: "Request",
 			Configuration: Request{
 				Method:      http.MethodGet,
 				Headers:     make([]etc.Header, 0),
@@ -183,14 +185,14 @@ func (h *Component) Ports() []module.Port {
 			Name:          ResponsePort,
 			Label:         "Response",
 			Position:      module.Right,
+			Source:        true,
 			Configuration: Response{},
 		},
 
 		{
-			Name:          module.SettingsPort,
+			Name:          v1alpha1.SettingsPort,
 			Label:         "Settings",
 			Configuration: h.settings,
-			Source:        true,
 		},
 	}
 
@@ -201,7 +203,7 @@ func (h *Component) Ports() []module.Port {
 	return append(ports, module.Port{
 		Name:          ErrorPort,
 		Label:         "Error",
-		Source:        false,
+		Source:        true,
 		Position:      module.Bottom,
 		Configuration: Error{},
 	})

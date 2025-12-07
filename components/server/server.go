@@ -10,8 +10,8 @@ import (
 	"github.com/tiny-systems/http-module/pkg/utils"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
+	utils2 "github.com/tiny-systems/module/pkg/utils"
 	"github.com/tiny-systems/module/registry"
-	"go.uber.org/atomic"
 	"io"
 	"net"
 	"net/http"
@@ -28,8 +28,11 @@ const (
 	ResponsePort         = "response"
 	RequestPort          = "request"
 	StartPort            = "start"
-	StopPort             = "stop"
 	StatusPort           = "status"
+)
+
+const (
+	PortMetadata = "http-server-port"
 )
 
 type Component struct {
@@ -38,9 +41,6 @@ type Component struct {
 	settingsLock *sync.Mutex
 	//
 	startSettings Start
-	//
-	contexts    map[string]chan Response
-	contextLock *sync.RWMutex
 
 	publicListenAddrLock *sync.Mutex
 	publicListenAddr     []string
@@ -51,9 +51,10 @@ type Component struct {
 
 	runLock *sync.Mutex
 
-	startErr *atomic.Error
-	//
-	node v1alpha1.TinyNode
+	listenPortLock *sync.Mutex
+	listenPort     int
+
+	nodeName string
 
 	// k8s client wrapper
 	client module.Client
@@ -67,10 +68,11 @@ func (h *Component) Instance() module.Component {
 		publicListenAddrLock: &sync.Mutex{},
 		cancelFuncLock:       &sync.Mutex{},
 		runLock:              &sync.Mutex{},
+		listenPortLock:       &sync.Mutex{},
 		//
 		settingsLock: &sync.Mutex{},
 		//
-		startErr: &atomic.Error{},
+
 		startSettings: Start{
 			WriteTimeout: 10,
 			ReadTimeout:  60,
@@ -78,14 +80,12 @@ func (h *Component) Instance() module.Component {
 		},
 		settings: Settings{
 			EnableStatusPort: false,
-			EnableStopPort:   false,
 		},
 	}
 }
 
 type Settings struct {
 	EnableStatusPort bool `json:"enableStatusPort" required:"true" title:"Enable status port" description:"Status port notifies when server is up or down"`
-	EnableStopPort   bool `json:"enableStopPort" required:"true" title:"Enable stop port" description:"Stop port allows you to stop server"`
 }
 
 type StartContext any
@@ -114,9 +114,6 @@ type Request struct {
 type Control struct {
 	Status     string   `json:"status" title:"Status" readonly:"true"`
 	ListenAddr []string `json:"listenAddr" title:"Listen Address" readonly:"true"`
-}
-
-type Stop struct {
 }
 
 type Status struct {
@@ -148,15 +145,15 @@ func (h *Component) stop() error {
 	if h.cancelFunc == nil {
 		return nil
 	}
+	// stop with no error
 	h.cancelFunc()
-
 	return nil
 }
 
-func (h *Component) setCancelFunc(f func()) {
+func (h *Component) setCancelFunc(causeFunc context.CancelFunc) {
 	h.cancelFuncLock.Lock()
 	defer h.cancelFuncLock.Unlock()
-	h.cancelFunc = f
+	h.cancelFunc = causeFunc
 }
 
 func (h *Component) isRunning() bool {
@@ -166,7 +163,10 @@ func (h *Component) isRunning() bool {
 	return h.cancelFunc != nil
 }
 
-func (h *Component) start(ctx context.Context, handler module.Handler) error {
+// start
+// listenPort == master
+// listenPort > 0 means it is slave
+func (h *Component) start(ctx context.Context, listenPort int, handler module.Handler) error {
 	//
 	if h.client == nil {
 		return fmt.Errorf("unable to start, no client available")
@@ -176,7 +176,7 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	defer h.runLock.Unlock()
 
 	e := echo.New()
-	e.HideBanner = false
+	e.HideBanner = true
 	e.HidePort = false
 
 	serverCtx, serverCancel := context.WithCancel(ctx)
@@ -184,8 +184,6 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 
 	h.setCancelFunc(serverCancel)
 
-	h.contexts = make(map[string]chan Response)
-	h.contextLock = &sync.RWMutex{}
 	//
 	e.Any("*", func(c echo.Context) error {
 		id, err := uuid.NewUUID()
@@ -224,57 +222,24 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 		body, _ := io.ReadAll(req.Body)
 		requestResult.Body = utils.BytesToString(body)
 
-		ch := make(chan Response)
-
-		//h.contexts.Put(idStr, ch)
-
-		h.contextLock.Lock()
-		h.contexts[idStr] = ch
-		h.contextLock.Unlock()
-
-		defer func() {
-			// deregister first
-			h.contextLock.Lock()
-			defer h.contextLock.Unlock()
-
-			delete(h.contexts, idStr)
-			// close ch
-			close(ch)
-		}()
-
-		doneCh := make(chan struct{})
-		go func() {
-			defer close(doneCh)
-
-			for {
-				select {
-				case <-c.Request().Context().Done():
-					return
-
-				case <-ctx.Done():
-					return
-
-				case <-time.Tick(time.Duration(h.startSettings.ReadTimeout) * time.Second):
-					c.Error(fmt.Errorf("read timeout"))
-					return
-
-				case resp := <-ch:
-					for _, header := range resp.Headers {
-						c.Response().Header().Set(header.Key, header.Value)
-					}
-					if resp.ContentType != "" {
-						c.Response().Header().Set(etc.HeaderContentType, string(resp.ContentType))
-					}
-					_ = c.String(resp.StatusCode, fmt.Sprintf("%v", resp.Body))
-					return
-				}
-			}
-		}()
-
-		if err = handler(c.Request().Context(), RequestPort, requestResult); err != nil {
+		resp := handler(c.Request().Context(), RequestPort, requestResult)
+		if err = utils2.CheckForError(resp); err != nil {
 			return err
 		}
-		<-doneCh
+
+		respObj, ok := resp.(Response)
+		if !ok {
+			return fmt.Errorf("invalid response")
+		}
+
+		for _, header := range respObj.Headers {
+			c.Response().Header().Set(header.Key, header.Value)
+		}
+		if respObj.ContentType != "" {
+			c.Response().Header().Set(etc.HeaderContentType, string(respObj.ContentType))
+		}
+		_ = c.String(respObj.StatusCode, fmt.Sprintf("%v", respObj.Body))
+
 		return nil
 	})
 
@@ -282,15 +247,11 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	e.Server.WriteTimeout = time.Duration(h.startSettings.WriteTimeout) * time.Second
 
 	var (
-		listenPort      int
 		actualLocalPort int
 	)
 
-	if annotationPort, err := strconv.Atoi(h.node.Labels[v1alpha1.SuggestedHttpPortAnnotation]); err == nil {
-		listenPort = annotationPort
-	}
-
-	if len(h.startSettings.Hostnames) == 1 {
+	if listenPort == 0 && len(h.startSettings.Hostnames) == 1 {
+		// try to use user defined port as suggested
 		portParts := strings.Split(h.startSettings.Hostnames[0], ":")
 		if len(portParts) == 2 {
 			// we have single hostname defined with explicit port defined, try parse it and use it
@@ -300,18 +261,24 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 		}
 	}
 
+	// auto suggested port
 	var listenAddr = ":0"
 
 	if listenPort > 0 {
+		// if port suggested we listen to it
 		listenAddr = fmt.Sprintf(":%d", listenPort)
 	}
 
 	go func() {
 		err := e.Start(listenAddr)
+		if err == nil {
+			return
+		}
+
 		if errors.Is(err, http.ErrServerClosed) {
 			return
 		}
-		h.startErr.Store(err)
+		serverCancel()
 	}()
 
 	time.Sleep(time.Millisecond * 1500)
@@ -321,6 +288,9 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 			//
 
 			actualLocalPort = tcpAddr.Port
+
+			time.Sleep(time.Second)
+			h.setListenPort(actualLocalPort)
 			//
 			exposeCtx, exposeCancel := context.WithTimeout(ctx, time.Second*30)
 			defer exposeCancel()
@@ -330,20 +300,25 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 			var autoHostName string
 
 			if h.startSettings.AutoHostName {
-				autoHostNameParts := strings.Split(h.node.Name, ".")
+				autoHostNameParts := strings.Split(h.nodeName, ".")
 				autoHostName = autoHostNameParts[len(autoHostNameParts)-1]
 			}
 
 			publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
 			if err != nil {
+				// failed to expose port
 				publicURLs = []string{fmt.Sprintf("http://localhost:%d", tcpAddr.Port)}
 			}
-			h.setPublicListerAddr(publicURLs)
+
+			h.setPublicListenAddr(publicURLs)
 		}
 	}
 
-	// send status that we run
-	_ = h.sendStatus(ctx, h.startSettings.Context, handler)
+	// send status that we run is it is not slave
+	if listenPort == 0 {
+		_ = h.sendStatus(ctx, h.startSettings.Context, handler)
+	}
+
 	// ask to reconcile (redraw the component)
 
 	<-serverCtx.Done()
@@ -352,25 +327,41 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	defer shutDownCancel()
 
 	_ = e.Shutdown(shutdownCtx)
-	h.setCancelFunc(nil)
 
+	h.setCancelFunc(nil)
+	h.setListenPort(0)
 	//
+
 	discloseCtx, discloseCancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer discloseCancel()
 
 	_ = h.client.DisclosePort(discloseCtx, actualLocalPort)
 
-	// send status when we stopped
-	_ = h.sendStatus(discloseCtx, h.startSettings.Context, handler)
-	// ask to reconcile (redraw the component)
+	h.setPublicListenAddr([]string{})
 
-	return h.startErr.Load()
+	// send status when we stopped
+	if listenPort == 0 {
+		_ = h.sendStatus(discloseCtx, h.startSettings.Context, handler)
+	}
+
+	return serverCtx.Err()
 }
 
-func (h *Component) setPublicListerAddr(addr []string) {
+func (h *Component) setPublicListenAddr(addr []string) {
 	h.publicListenAddrLock.Lock()
 	defer h.publicListenAddrLock.Unlock()
 	h.publicListenAddr = addr
+}
+
+func (h *Component) setListenPort(port int) {
+	h.listenPortLock.Lock()
+	defer h.listenPortLock.Unlock()
+	h.listenPort = port
+}
+func (h *Component) getListenPort() int {
+	h.listenPortLock.Lock()
+	defer h.listenPortLock.Unlock()
+	return h.listenPort
 }
 
 func (h *Component) getPublicListerAddr() []string {
@@ -379,26 +370,44 @@ func (h *Component) getPublicListerAddr() []string {
 	return h.publicListenAddr
 }
 
-func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) error {
+func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
 
 	switch port {
-	case module.NodePort:
-		h.node, _ = msg.(v1alpha1.TinyNode)
+	case v1alpha1.ReconcilePort:
 
-	case module.ClientPort:
+		if node, ok := msg.(v1alpha1.TinyNode); ok {
+			//
+			// all replicas should get copy of same node
+			h.nodeName = node.Name
+			// start server
+
+			listenPort, _ := strconv.Atoi(node.Status.Metadata[PortMetadata])
+
+			if listenPort == h.getListenPort() {
+				// it is the same instance
+				return nil
+			}
+
+			// start server in background
+			// stop if we were running
+			_ = h.stop()
+			// start server with suggested port
+			_ = h.start(context.Background(), listenPort, handler)
+		}
+
+	case v1alpha1.ClientPort:
 		h.client, _ = msg.(module.Client)
 
-		return h.stop()
-
-	case module.SettingsPort:
+	case v1alpha1.SettingsPort:
 		in, ok := msg.(Settings)
 		if !ok {
 			return fmt.Errorf("invalid settings message")
 		}
 
 		h.settingsLock.Lock()
+		defer h.settingsLock.Unlock()
+
 		h.settings = in
-		h.settingsLock.Unlock()
 
 	case StartPort:
 		in, ok := msg.(Start)
@@ -407,29 +416,15 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		}
 
 		h.startSettings = in
-		return h.start(ctx, handler)
-
-	case StopPort:
-		return h.stop()
+		return h.start(ctx, 0, handler)
 
 	case ResponsePort:
 		in, ok := msg.(Response)
 		if !ok {
 			return fmt.Errorf("invalid response message")
 		}
-
-		if h.contexts == nil {
-			return fmt.Errorf("unknown request ID %s", in.RequestID)
-		}
-
-		h.contextLock.RLock()
-		ch := h.contexts[in.RequestID]
-		h.contextLock.RUnlock()
-
-		if ch == nil {
-			return fmt.Errorf("context '%s' not found", in.RequestID)
-		}
-		ch <- in
+		// we return response as final destination reached
+		return in
 
 	default:
 		return fmt.Errorf("port %s is not supported", port)
@@ -438,7 +433,7 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 	return nil
 }
 
-func (h *Component) getControl() interface{} {
+func (h *Component) getControl() Control {
 	if h.isRunning() {
 		return Control{
 			Status:     "Running",
@@ -457,35 +452,36 @@ func (h *Component) Ports() []module.Port {
 
 	ports := []module.Port{
 		{
-			Name: module.NodePort, // to receive tiny node instance
+			Name: v1alpha1.ReconcilePort, // to receive TinyNode instance
 		},
 		{
-			Name: module.ClientPort, // to receive k8s client
+			Name: v1alpha1.ClientPort, // to receive k8s client wrapper
 		},
 		{
-			Name:          module.SettingsPort,
+			Name:          v1alpha1.SettingsPort,
 			Label:         "Settings",
 			Configuration: h.settings,
-			Source:        true,
 		},
 		{
-			Name:          RequestPort,
-			Label:         "Request",
-			Configuration: Request{},
-			Position:      module.Right,
+			Name:                  RequestPort,
+			Label:                 "Request",
+			Source:                true,
+			Configuration:         Request{},
+			Position:              module.Right,
+			ResponseConfiguration: Response{},
 		},
 		{
 			Name:     ResponsePort,
 			Label:    "Response",
-			Source:   true,
 			Position: module.Right,
 			Configuration: Response{
 				StatusCode: 200,
 			},
 		},
 		{
-			Name:          module.ControlPort,
+			Name:          v1alpha1.ControlPort,
 			Label:         "Dashboard",
+			Source:        true,
 			Configuration: h.getControl(),
 		},
 	}
@@ -493,21 +489,9 @@ func (h *Component) Ports() []module.Port {
 	ports = append(ports, module.Port{
 		Name:          StartPort,
 		Label:         "Start",
-		Source:        true,
 		Position:      module.Left,
 		Configuration: h.startSettings,
 	})
-
-	// programmatically stop server
-	if h.settings.EnableStopPort {
-		ports = append(ports, module.Port{
-			Position:      module.Left,
-			Name:          StopPort,
-			Label:         "Stop",
-			Source:        true,
-			Configuration: Stop{},
-		})
-	}
 
 	// programmatically use status in flows
 
@@ -516,6 +500,7 @@ func (h *Component) Ports() []module.Port {
 			Position:      module.Bottom,
 			Name:          StatusPort,
 			Label:         "Status",
+			Source:        true,
 			Configuration: h.getStatus(),
 		})
 	}
@@ -529,17 +514,25 @@ func (h *Component) getStatus() Status {
 	}
 }
 
-func (h *Component) sendStatus(ctx context.Context, start StartContext, handler module.Handler) error {
-	_ = handler(ctx, module.ReconcilePort, nil)
+// sendStatus changes node and sends status if it's port enabled
+func (h *Component) sendStatus(ctx context.Context, _ StartContext, handler module.Handler) any {
+
+	_ = handler(ctx, v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+
+		if n.Status.Metadata == nil {
+			n.Status.Metadata = map[string]string{}
+		}
+
+		n.Status.Metadata = map[string]string{
+			PortMetadata: fmt.Sprintf("%d", h.getListenPort()),
+		}
+		return nil
+	})
 
 	if !h.settings.EnableStatusPort {
 		return nil
 	}
-	return handler(ctx, StatusPort, Status{
-		Context:    start,
-		ListenAddr: h.getPublicListerAddr(),
-		IsRunning:  h.isRunning(),
-	})
+	return handler(ctx, StatusPort, h.getStatus())
 }
 
 var _ module.Component = (*Component)(nil)
