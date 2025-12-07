@@ -46,7 +46,7 @@ func (t *Component) GetInfo() module.ComponentInfo {
 	}
 }
 
-func (t *Component) Handle(ctx context.Context, handler module.Handler, _ string, msg interface{}) error {
+func (t *Component) Handle(ctx context.Context, handler module.Handler, _ string, msg interface{}) any {
 	in, ok := msg.(InMessage)
 	if !ok {
 		return fmt.Errorf("msg type not inMessage")
@@ -91,14 +91,13 @@ func (t *Component) Ports() []module.Port {
 		{
 			Name:          InPort,
 			Label:         "In",
-			Source:        true,
 			Configuration: InMessage{},
 			Position:      module.Left,
 		},
 		{
 			Name:          OutPort,
 			Label:         "Out",
-			Source:        false,
+			Source:        true,
 			Configuration: OutMessage{},
 			Position:      module.Right,
 		},

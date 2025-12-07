@@ -27,7 +27,7 @@ func TestComponent_Handle(t1 *testing.T) {
 				ctx:  context.Background(),
 				port: "",
 				msg:  OutMessage{},
-				handler: func(ctx context.Context, port string, data interface{}) error {
+				handler: func(ctx context.Context, port string, data interface{}) any {
 					t1.Errorf("handler err")
 					return nil
 				},
@@ -39,7 +39,7 @@ func TestComponent_Handle(t1 *testing.T) {
 				ctx:  context.Background(),
 				port: "",
 				msg:  InMessage{},
-				handler: func(ctx context.Context, port string, data interface{}) error {
+				handler: func(ctx context.Context, port string, data interface{}) any {
 					msg := data.(OutMessage)
 					if msg.Found {
 						return fmt.Errorf("should not found")
@@ -60,7 +60,7 @@ func TestComponent_Handle(t1 *testing.T) {
 						Value: "s",
 					},
 				},
-				handler: func(ctx context.Context, port string, data interface{}) error {
+				handler: func(ctx context.Context, port string, data interface{}) any {
 					msg := data.(OutMessage)
 					if msg.Found {
 						return fmt.Errorf("should not found")
@@ -83,7 +83,7 @@ func TestComponent_Handle(t1 *testing.T) {
 						},
 					},
 				},
-				handler: func(ctx context.Context, _ string, data interface{}) error {
+				handler: func(ctx context.Context, _ string, data interface{}) any {
 					msg, ok := data.(OutMessage)
 					if !ok {
 						return fmt.Errorf("invalid type")
@@ -115,7 +115,7 @@ func TestComponent_Handle(t1 *testing.T) {
 						},
 					},
 				},
-				handler: func(ctx context.Context, _ string, data interface{}) error {
+				handler: func(ctx context.Context, _ string, data interface{}) any {
 					msg, ok := data.(OutMessage)
 					if !ok {
 						return fmt.Errorf("invalid type")
