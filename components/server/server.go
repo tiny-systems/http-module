@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
+	"github.com/rs/zerolog/log"
 	"github.com/tiny-systems/http-module/components/etc"
 	"github.com/tiny-systems/http-module/pkg/utils"
 	"github.com/tiny-systems/module/api/v1alpha1"
@@ -49,7 +50,7 @@ type Component struct {
 	cancelFunc     context.CancelFunc
 	cancelFuncLock *sync.Mutex
 
-	runLock *sync.Mutex
+	startStopLock *sync.Mutex // Protects start/stop sequence to prevent races
 
 	listenPortLock *sync.Mutex
 	listenPort     int
@@ -67,7 +68,7 @@ func (h *Component) Instance() module.Component {
 		publicListenAddr:     []string{},
 		publicListenAddrLock: &sync.Mutex{},
 		cancelFuncLock:       &sync.Mutex{},
-		runLock:              &sync.Mutex{},
+		startStopLock:        &sync.Mutex{},
 		listenPortLock:       &sync.Mutex{},
 		//
 		settingsLock: &sync.Mutex{},
@@ -146,6 +147,7 @@ func (h *Component) stop() error {
 		return nil
 	}
 	// stop with no error
+	log.Info().Msg("stopping HTTP server")
 	h.cancelFunc()
 	return nil
 }
@@ -172,8 +174,7 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		return fmt.Errorf("unable to start, no client available")
 	}
 
-	h.runLock.Lock()
-	defer h.runLock.Unlock()
+	log.Info().Msgf("starting %d", listenPort)
 
 	e := echo.New()
 	e.HideBanner = true
@@ -271,6 +272,7 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 	go func() {
 		err := e.Start(listenAddr)
+
 		if err == nil {
 			return
 		}
@@ -278,6 +280,8 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		if errors.Is(err, http.ErrServerClosed) {
 			return
 		}
+
+		log.Error().Err(err).Int("port", listenPort).Msg("failed to start HTTP server")
 		serverCancel()
 	}()
 
@@ -285,9 +289,9 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 	if e.Listener != nil {
 		if tcpAddr, ok := e.Listener.Addr().(*net.TCPAddr); ok {
-			//
-
 			actualLocalPort = tcpAddr.Port
+
+			log.Info().Int("port", actualLocalPort).Msg("HTTP server started successfully")
 
 			time.Sleep(time.Second)
 			h.setListenPort(actualLocalPort)
@@ -332,16 +336,18 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 	h.setListenPort(0)
 	//
 
-	discloseCtx, discloseCancel := context.WithTimeout(context.Background(), time.Second*30)
-	defer discloseCancel()
+	if actualLocalPort > 0 {
+		discloseCtx, discloseCancel := context.WithTimeout(context.Background(), time.Second*30)
+		defer discloseCancel()
 
-	_ = h.client.DisclosePort(discloseCtx, actualLocalPort)
+		_ = h.client.DisclosePort(discloseCtx, actualLocalPort)
+	}
 
 	h.setPublicListenAddr([]string{})
 
 	// send status when we stopped
 	if listenPort == 0 {
-		_ = h.sendStatus(discloseCtx, h.startSettings.Context, handler)
+		_ = h.sendStatus(context.Background(), h.startSettings.Context, handler)
 	}
 
 	return serverCtx.Err()
@@ -388,11 +394,29 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 				return nil
 			}
 
-			// start server in background
+			if listenPort == 0 {
+				// No port assigned yet, non-leader replicas should wait
+				return nil
+			}
+
+			// Protect stop/start sequence to prevent races
+			h.startStopLock.Lock()
+			defer h.startStopLock.Unlock()
+
+			// Double-check after acquiring lock (another goroutine might have started)
+			if listenPort == h.getListenPort() {
+				return nil
+			}
+
 			// stop if we were running
 			_ = h.stop()
+
 			// start server with suggested port
-			_ = h.start(context.Background(), listenPort, handler)
+			go func() {
+				// @todo best effort to start server in background
+				_ = h.start(context.Background(), listenPort, handler)
+			}()
+
 		}
 
 	case v1alpha1.ClientPort:
@@ -451,12 +475,15 @@ func (h *Component) Ports() []module.Port {
 	defer h.settingsLock.Unlock()
 
 	ports := []module.Port{
-		{
-			Name: v1alpha1.ReconcilePort, // to receive TinyNode instance
-		},
+		// receive client first
 		{
 			Name: v1alpha1.ClientPort, // to receive k8s client wrapper
 		},
+
+		{
+			Name: v1alpha1.ReconcilePort, // to receive TinyNode instance
+		},
+
 		{
 			Name:          v1alpha1.SettingsPort,
 			Label:         "Settings",
