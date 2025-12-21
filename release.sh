@@ -59,8 +59,35 @@ bump_version() {
     echo "v${major}.${minor}.${patch}"
 }
 
+# Function to update SDK to latest version
+update_sdk() {
+    info "Updating github.com/tiny-systems/module to latest version..."
+
+    # Get the latest version
+    go get github.com/tiny-systems/module@latest
+
+    # Tidy up
+    info "Running go mod tidy..."
+    go mod tidy
+
+    # Show the updated version
+    NEW_VERSION=$(go list -m github.com/tiny-systems/module | awk '{print $2}')
+    info "SDK updated to: $NEW_VERSION"
+
+    # Check if go.mod was modified
+    if [[ -n $(git status -s go.mod go.sum 2>/dev/null) ]]; then
+        info "go.mod and/or go.sum have been modified"
+        warn "Don't forget to commit the changes!"
+    fi
+}
+
 # Main script
 main() {
+    # Handle 'update' command
+    if [[ "${1:-}" == "update" ]]; then
+        update_sdk
+        exit 0
+    fi
     # Check if git repo
     if ! git rev-parse --git-dir > /dev/null 2>&1; then
         error "Not a git repository"
