@@ -310,6 +310,7 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 			publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
 			if err != nil {
+				log.Error().Err(err).Msg("failed to expose port")
 				// failed to expose port
 				publicURLs = []string{fmt.Sprintf("http://localhost:%d", tcpAddr.Port)}
 			}
