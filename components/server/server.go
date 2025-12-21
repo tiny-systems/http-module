@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog/log"
@@ -227,6 +228,8 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		if err = utils2.CheckForError(resp); err != nil {
 			return err
 		}
+
+		spew.Dump(resp)
 
 		respObj, ok := resp.(Response)
 		if !ok {
