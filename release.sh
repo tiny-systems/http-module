@@ -77,7 +77,17 @@ update_sdk() {
     # Check if go.mod was modified
     if [[ -n $(git status -s go.mod go.sum 2>/dev/null) ]]; then
         info "go.mod and/or go.sum have been modified"
-        warn "Don't forget to commit the changes!"
+        read -p "Commit the changes? (Y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            git add go.mod go.sum
+            git commit -m "update SDK to $NEW_VERSION"
+            info "Changes committed"
+        else
+            warn "Don't forget to commit the changes!"
+        fi
+    else
+        info "No changes to commit (SDK already at latest version)"
     fi
 }
 
