@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog/log"
 	"github.com/tiny-systems/http-module/components/etc"
@@ -101,7 +100,6 @@ type Start struct {
 
 type Request struct {
 	Context       StartContext `json:"context"`
-	RequestID     string       `json:"requestID" required:"true"`
 	RequestURI    string       `json:"requestURI" required:"true"`
 	RequestParams url.Values   `json:"requestParams" required:"true"`
 	Host          string       `json:"host" required:"true"`
@@ -124,7 +122,6 @@ type Status struct {
 }
 
 type Response struct {
-	RequestID   string          `json:"requestID" required:"true" title:"Request ID" minLength:"1" description:"To match response with request pass request ID to response port"`
 	StatusCode  int             `json:"statusCode" required:"true" title:"Status Code" description:"HTTP status code for response" minimum:"100" default:"200" maximum:"599"`
 	ContentType etc.ContentType `json:"contentType" required:"true"`
 	Headers     []etc.Header    `json:"headers,omitempty"  title:"Response headers"`
@@ -187,15 +184,9 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 	//
 	e.Any("*", func(c echo.Context) error {
-		id, err := uuid.NewUUID()
-		if err != nil {
-			return err
-		}
 
-		idStr := id.String()
 		requestResult := Request{
 			Context:       h.startSettings.Context,
-			RequestID:     idStr,
 			Host:          c.Request().Host,
 			Method:        c.Request().Method,
 			RequestURI:    c.Request().RequestURI,
@@ -224,7 +215,7 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		requestResult.Body = utils.BytesToString(body)
 
 		resp := handler(c.Request().Context(), RequestPort, requestResult)
-		if err = utils2.CheckForError(resp); err != nil {
+		if err := utils2.CheckForError(resp); err != nil {
 			return err
 		}
 
