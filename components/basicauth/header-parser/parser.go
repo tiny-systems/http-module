@@ -41,7 +41,7 @@ func (t *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "Basic Auth Headers Parser",
-		Info:        "Parses HTTP headers for Basic Authorization header",
+		Info:        "Extracts Basic Auth credentials from HTTP headers. In port receives: context + headers array. Out port always emits: {context, found, user, password}. If Authorization header with 'Basic' scheme found, decodes base64 and sets found=true with user/password. Otherwise found=false.",
 		Tags:        []string{"HTTP", "Auth"},
 	}
 }
@@ -107,5 +107,5 @@ func (t *Component) Ports() []module.Port {
 var _ module.Component = (*Component)(nil)
 
 func init() {
-	registry.Register(&Component{})
+	registry.Register((&Component{}).Instance())
 }
