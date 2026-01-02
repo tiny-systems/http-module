@@ -69,8 +69,8 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "HTTP Client",
-		Info:        "Performs HTTP requests.",
-		Tags:        []string{"HTTP", "Component"},
+		Info:        "Outbound HTTP request maker. Request port receives: context, method, timeout, URL, headers, contentType, body. Blocks until HTTP response received. On success (status < 400): emits context + response on Response port. On failure or status >= 400: returns error, or if enableErrorPort=true in settings, emits on Error port instead.",
+		Tags:        []string{"HTTP", "Client"},
 	}
 }
 
@@ -212,5 +212,5 @@ func (h *Component) Ports() []module.Port {
 var _ module.Component = (*Component)(nil)
 
 func init() {
-	registry.Register(&Component{})
+	registry.Register((&Component{}).Instance())
 }

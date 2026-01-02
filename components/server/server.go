@@ -94,8 +94,8 @@ type Start struct {
 	Context      StartContext `json:"context,omitempty" configurable:"true" title:"Context" description:"Start context"`
 	AutoHostName bool         `json:"autoHostName" title:"Automatically generate hostname" description:"Use cluster auto subdomain setup if any."`
 	Hostnames    []string     `json:"hostnames,omitempty" title:"Hostnames"  description:"List of virtual host this server should be bound to."` //requiredWhen:"['kind', 'equal', 'enum 1']"
-	ReadTimeout  int          `json:"readTimeout" required:"true" title:"Read Timeout" description:"Read timeout is the maximum duration for reading the entire request, including the body. A zero or negative value means there will be no timeout."`
-	WriteTimeout int          `json:"writeTimeout" required:"true" title:"Write Timeout" description:"Write timeout is the maximum duration before timing out writes of the response. It is reset whenever a new request's header is read."`
+	ReadTimeout  int          `json:"readTimeout" required:"true" title:"Read Timeout" description:"Read timeout is the maximum duration for reading the entire request in seconds, including the body. A zero or negative value means there will be no timeout."`
+	WriteTimeout int          `json:"writeTimeout" required:"true" title:"Write Timeout" description:"Write timeout is the maximum duration before timing out writes of the response in seconds. It is reset whenever a new request's header is read."`
 }
 
 type Request struct {
@@ -132,7 +132,7 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "HTTP Server",
-		Info:        "Serves HTTP requests. Each HTTP requests creates its representing message on a Request port. To display HTTP response incoming message should find its way to the Response port. Other way HTTP request timeout error will be shown.",
+		Info:        "HTTP request handler. Start port configures and starts the server (context, autoHostName, hostnames for virtual hosts, readTimeout, writeTimeout). Each incoming HTTP request emits on Request port (blocks until Response port receives reply). Wire Request to processing logic, then wire result to Response port with statusCode, contentType, headers, body. Request times out if Response not received within readTimeout.",
 		Tags:        []string{"HTTP", "Server"},
 	}
 }
@@ -557,5 +557,5 @@ func (h *Component) sendStatus(ctx context.Context, _ StartContext, handler modu
 var _ module.Component = (*Component)(nil)
 
 func init() {
-	registry.Register(&Component{})
+	registry.Register((&Component{}).Instance())
 }
