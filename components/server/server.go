@@ -171,16 +171,25 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		return fmt.Errorf("unable to start, no client available")
 	}
 
-	log.Info().Msgf("starting %d", listenPort)
+	log.Info().
+		Int("listenPort", listenPort).
+		Interface("ctxErrOnEntry", ctx.Err()).
+		Msg("http-server start: entering")
 
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = false
 
-	// Use Background context for HTTP server lifecycle - it should not depend
-	// on the caller's context (gRPC request) which may be cancelled
-	serverCtx, serverCancel := context.WithCancel(context.Background())
+	serverCtx, serverCancel := context.WithCancel(ctx)
 	defer serverCancel()
+
+	// Monitor parent context cancellation
+	go func() {
+		<-ctx.Done()
+		log.Info().
+			Interface("ctxErr", ctx.Err()).
+			Msg("http-server start: parent context cancelled")
+	}()
 
 	h.setCancelFunc(serverCancel)
 
@@ -317,9 +326,19 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		_ = h.sendStatus(ctx, h.startSettings.Context, handler)
 	}
 
+	log.Info().
+		Int("listenPort", listenPort).
+		Msg("http-server start: waiting on serverCtx.Done()")
+
 	// ask to reconcile (redraw the component)
 
 	<-serverCtx.Done()
+
+	log.Info().
+		Int("listenPort", listenPort).
+		Interface("serverCtxErr", serverCtx.Err()).
+		Interface("parentCtxErr", ctx.Err()).
+		Msg("http-server start: serverCtx done, shutting down")
 
 	shutdownCtx, shutDownCancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer shutDownCancel()
@@ -343,6 +362,10 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 	if listenPort == 0 {
 		_ = h.sendStatus(context.Background(), h.startSettings.Context, handler)
 	}
+
+	log.Info().
+		Int("listenPort", listenPort).
+		Msg("http-server start: exiting")
 
 	return serverCtx.Err()
 }
