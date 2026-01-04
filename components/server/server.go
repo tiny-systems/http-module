@@ -177,7 +177,9 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 	e.HideBanner = true
 	e.HidePort = false
 
-	serverCtx, serverCancel := context.WithCancel(ctx)
+	// Use Background context for HTTP server lifecycle - it should not depend
+	// on the caller's context (gRPC request) which may be cancelled
+	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
 
 	h.setCancelFunc(serverCancel)
