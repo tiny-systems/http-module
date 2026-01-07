@@ -402,7 +402,12 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			//
 			// all replicas should get copy of same node
 			h.nodeName = node.Name
-			// start server
+
+			// Leader should wait for StartPort signal, not auto-start via ReconcilePort
+			// Only replicas should start via ReconcilePort to sync with leader's port
+			if utils2.IsLeader(ctx) {
+				return nil
+			}
 
 			listenPort, _ := strconv.Atoi(node.Status.Metadata[PortMetadata])
 
