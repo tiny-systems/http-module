@@ -413,7 +413,26 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			// Leader should wait for StartPort signal for initial start
 			// BUT if port metadata is set (server was previously running), leader should
 			// also start via ReconcilePort to recover after pod restart
-			if utils2.IsLeader(ctx) && listenPort == 0 {
+			// ALSO: if ConfigMetadata is set but port is 0, a replica received StartPort
+			// and signaled the leader to start
+			configData := node.Status.Metadata[ConfigMetadata]
+			startRequested := configData != "" && listenPort == 0
+
+			if utils2.IsLeader(ctx) && listenPort == 0 && !startRequested {
+				return nil
+			}
+
+			// Leader should start if signaled by replica
+			if utils2.IsLeader(ctx) && startRequested && h.getListenPort() == 0 {
+				log.Info().Msg("http_server: leader starting server after replica signal")
+				// Restore config from metadata
+				var savedConfig Start
+				if err := json.Unmarshal([]byte(configData), &savedConfig); err == nil {
+					h.startSettings = savedConfig
+				}
+				go func() {
+					_ = h.start(context.Background(), 0, handler)
+				}()
 				return nil
 			}
 
@@ -478,10 +497,21 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 		h.startSettings = in
 
-		// Only leader should start server via StartPort with port=0 (random port)
-		// Replicas will start via ReconcilePort when they receive port metadata from leader
+		// If replica receives StartPort, signal the leader to start by setting config metadata
+		// Leader will see this via ReconcilePort and start the server
 		if !utils2.IsLeader(ctx) {
-			log.Debug().Msg("http_server: StartPort ignored on replica, waiting for ReconcilePort")
+			log.Info().Msg("http_server: StartPort on replica, signaling leader via metadata")
+			// Store config so leader can pick it up via ReconcilePort
+			_ = handler(ctx, v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+				if n.Status.Metadata == nil {
+					n.Status.Metadata = map[string]string{}
+				}
+				// Store config but NOT port - this signals "start requested"
+				if configData, err := json.Marshal(h.startSettings); err == nil {
+					n.Status.Metadata[ConfigMetadata] = string(configData)
+				}
+				return nil
+			})
 			return nil
 		}
 
