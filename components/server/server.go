@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/labstack/echo/v4"
@@ -32,7 +33,8 @@ const (
 )
 
 const (
-	PortMetadata = "http-server-port"
+	PortMetadata   = "http-server-port"
+	ConfigMetadata = "http-server-config"
 )
 
 type Component struct {
@@ -422,6 +424,15 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 				return nil
 			}
 
+			// Restore startSettings from metadata if available
+			// This ensures replicas get the same config (including Context) as the leader
+			if configData, ok := node.Status.Metadata[ConfigMetadata]; ok && configData != "" {
+				var savedConfig Start
+				if err := json.Unmarshal([]byte(configData), &savedConfig); err == nil {
+					h.startSettings = savedConfig
+				}
+			}
+
 			// Protect stop/start sequence to prevent races
 			h.startStopLock.Lock()
 			defer h.startStopLock.Unlock()
@@ -576,9 +587,13 @@ func (h *Component) sendStatus(ctx context.Context, _ StartContext, handler modu
 			n.Status.Metadata = map[string]string{}
 		}
 
-		n.Status.Metadata = map[string]string{
-			PortMetadata: fmt.Sprintf("%d", h.getListenPort()),
+		n.Status.Metadata[PortMetadata] = fmt.Sprintf("%d", h.getListenPort())
+
+		// Store serialized startSettings so replicas can restore full config
+		if configData, err := json.Marshal(h.startSettings); err == nil {
+			n.Status.Metadata[ConfigMetadata] = string(configData)
 		}
+
 		return nil
 	})
 
