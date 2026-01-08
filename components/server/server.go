@@ -483,6 +483,17 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 		h.startSettings = in
 
+		// Prevent double-start: check if already running or starting
+		// cancelFunc is set immediately when start() is called
+		h.cancelFuncLock.Lock()
+		isStarting := h.cancelFunc != nil
+		h.cancelFuncLock.Unlock()
+
+		if h.getListenPort() > 0 || isStarting {
+			log.Info().Int("port", h.getListenPort()).Bool("isStarting", isStarting).Msg("http_server: StartPort ignored, already running/starting")
+			return nil
+		}
+
 		// Any pod that receives StartPort starts the server directly
 		// The server will set port metadata, and other pods will sync via ReconcilePort
 		return h.start(ctx, 0, handler)
