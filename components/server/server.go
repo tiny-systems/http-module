@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/labstack/echo/v4"
@@ -575,6 +576,19 @@ func (h *Component) sendStatus(ctx context.Context, _ StartContext, handler modu
 		n.Status.Metadata = map[string]string{
 			PortMetadata: fmt.Sprintf("%d", h.getListenPort()),
 		}
+
+		// Update control port configuration to reflect current running state
+		control := h.getControl()
+		controlData, err := json.Marshal(control)
+		if err == nil {
+			for i := range n.Status.Ports {
+				if n.Status.Ports[i].Name == v1alpha1.ControlPort {
+					n.Status.Ports[i].Configuration = controlData
+					break
+				}
+			}
+		}
+
 		return nil
 	})
 
