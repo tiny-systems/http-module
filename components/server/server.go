@@ -477,6 +477,14 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		}
 
 		h.startSettings = in
+
+		// Only leader should start server via StartPort with port=0 (random port)
+		// Replicas will start via ReconcilePort when they receive port metadata from leader
+		if !utils2.IsLeader(ctx) {
+			log.Debug().Msg("http_server: StartPort ignored on replica, waiting for ReconcilePort")
+			return nil
+		}
+
 		return h.start(ctx, 0, handler)
 
 	case ResponsePort:
