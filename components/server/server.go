@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/labstack/echo/v4"
@@ -481,7 +480,10 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 }
 
 func (h *Component) getControl() Control {
-	if h.isRunning() {
+	// Use listenPort as source of truth instead of cancelFunc (isRunning)
+	// listenPort is set after server actually binds and cleared when it stops,
+	// making it reliable across all pods regardless of which one started the server
+	if h.getListenPort() > 0 {
 		return Control{
 			Status:     "Running",
 			ListenAddr: h.getPublicListerAddr(),
@@ -560,7 +562,7 @@ func (h *Component) Ports() []module.Port {
 func (h *Component) getStatus() Status {
 	return Status{
 		ListenAddr: h.getPublicListerAddr(),
-		IsRunning:  h.isRunning(),
+		IsRunning:  h.getListenPort() > 0,
 	}
 }
 
@@ -576,19 +578,6 @@ func (h *Component) sendStatus(ctx context.Context, _ StartContext, handler modu
 		n.Status.Metadata = map[string]string{
 			PortMetadata: fmt.Sprintf("%d", h.getListenPort()),
 		}
-
-		// Update control port configuration to reflect current running state
-		control := h.getControl()
-		controlData, err := json.Marshal(control)
-		if err == nil {
-			for i := range n.Status.Ports {
-				if n.Status.Ports[i].Name == v1alpha1.ControlPort {
-					n.Status.Ports[i].Configuration = controlData
-					break
-				}
-			}
-		}
-
 		return nil
 	})
 
