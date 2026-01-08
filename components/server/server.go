@@ -329,6 +329,10 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 	// send status that we run is it is not slave
 	if listenPort == 0 {
 		_ = h.sendStatus(ctx, h.startSettings.Context, handler)
+	} else {
+		// For replicas started via ReconcilePort, trigger a reconcile
+		// to update status display (port metadata is already correct)
+		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 	}
 
 	log.Info().
