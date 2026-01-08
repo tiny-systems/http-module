@@ -403,13 +403,14 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			// all replicas should get copy of same node
 			h.nodeName = node.Name
 
-			// Leader should wait for StartPort signal, not auto-start via ReconcilePort
-			// Only replicas should start via ReconcilePort to sync with leader's port
-			if utils2.IsLeader(ctx) {
+			listenPort, _ := strconv.Atoi(node.Status.Metadata[PortMetadata])
+
+			// Leader should wait for StartPort signal for initial start
+			// BUT if port metadata is set (server was previously running), leader should
+			// also start via ReconcilePort to recover after pod restart
+			if utils2.IsLeader(ctx) && listenPort == 0 {
 				return nil
 			}
-
-			listenPort, _ := strconv.Atoi(node.Status.Metadata[PortMetadata])
 
 			if listenPort == h.getListenPort() {
 				// it is the same instance
