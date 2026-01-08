@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -110,6 +111,7 @@ type Request struct {
 	Headers       []etc.Header `json:"headers,omitempty"`
 	Body          string       `json:"body"`
 	Scheme        string       `json:"scheme"`
+	PodName       string       `json:"podName" title:"Pod Name" description:"Name of the pod handling this request"`
 }
 
 type Control struct {
@@ -207,6 +209,7 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 			RealIP:        c.RealIP(),
 			Scheme:        c.Scheme(),
 			Headers:       make([]etc.Header, 0),
+			PodName:       os.Getenv("HOSTNAME"),
 		}
 		req := c.Request()
 
