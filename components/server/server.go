@@ -372,15 +372,22 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 	h.setPublicListenAddr([]string{})
 
-	// send status when we stopped - update metadata and trigger status refresh
-	// This applies to both leader (listenPort==0) and replicas (listenPort>0)
-	log.Info().
-		Int("listenPortParam", listenPort).
-		Int("currentListenPort", h.getListenPort()).
-		Msg("http-server start: sending stop status")
+	// Only leader (listenPort==0) should update metadata when stopping
+	// Replicas (listenPort>0) just stop locally - they don't own the metadata
+	if listenPort == 0 {
+		log.Info().
+			Int("currentListenPort", h.getListenPort()).
+			Msg("http-server start: leader sending stop status")
 
-	if err := h.sendStopStatus(handler); err != nil {
-		log.Error().Err(err).Msg("http-server start: failed to send stop status")
+		if err := h.sendStopStatus(handler); err != nil {
+			log.Error().Err(err).Msg("http-server start: failed to send stop status")
+		}
+	} else {
+		// Replica just triggers a local status refresh (no metadata change)
+		log.Info().
+			Int("listenPortParam", listenPort).
+			Msg("http-server start: replica stopped, triggering local status refresh")
+		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 	}
 
 	log.Info().
