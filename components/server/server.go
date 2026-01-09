@@ -57,6 +57,10 @@ type Component struct {
 	listenPortLock *sync.Mutex
 	listenPort     int
 
+	// metadataPort is synced from TinyNode metadata - source of truth for multi-pod status
+	metadataPortLock *sync.Mutex
+	metadataPort     int
+
 	nodeName string
 
 	// k8s client wrapper
@@ -72,6 +76,7 @@ func (h *Component) Instance() module.Component {
 		cancelFuncLock:       &sync.Mutex{},
 		startStopLock:        &sync.Mutex{},
 		listenPortLock:       &sync.Mutex{},
+		metadataPortLock:     &sync.Mutex{},
 		//
 		settingsLock: &sync.Mutex{},
 		//
@@ -421,6 +426,18 @@ func (h *Component) getPublicListerAddr() []string {
 	return h.publicListenAddr
 }
 
+func (h *Component) setMetadataPort(port int) {
+	h.metadataPortLock.Lock()
+	defer h.metadataPortLock.Unlock()
+	h.metadataPort = port
+}
+
+func (h *Component) getMetadataPort() int {
+	h.metadataPortLock.Lock()
+	defer h.metadataPortLock.Unlock()
+	return h.metadataPort
+}
+
 func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
 
 	switch port {
@@ -432,6 +449,8 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			h.nodeName = node.Name
 
 			listenPort, _ := strconv.Atoi(node.Status.Metadata[PortMetadata])
+			// Sync metadata port for all pods - this is the source of truth for status display
+			h.setMetadataPort(listenPort)
 			log.Info().Int("metadataPort", listenPort).Int("localPort", h.getListenPort()).Bool("isLeader", utils2.IsLeader(ctx)).Msg("http_server: ReconcilePort received")
 
 			// Leader should wait for StartPort signal for initial start
@@ -589,11 +608,10 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 }
 
 func (h *Component) getControl() Control {
-	// Use listenPort as source of truth instead of cancelFunc (isRunning)
-	// listenPort is set after server actually binds and cleared when it stops,
-	// making it reliable across all pods regardless of which one started the server
-	port := h.getListenPort()
-	log.Info().Int("listenPort", port).Msg("http_server: getControl called")
+	// Use metadataPort as source of truth - synced from TinyNode metadata
+	// This ensures consistent status display across all pods in multi-replica setup
+	port := h.getMetadataPort()
+	log.Info().Int("metadataPort", port).Int("localPort", h.getListenPort()).Msg("http_server: getControl called")
 	if port > 0 {
 		return Control{
 			Status:     "Running",
