@@ -696,6 +696,9 @@ func (h *Component) sendStopStatus(handler module.Handler) error {
 		Int("listenPort", h.getListenPort()).
 		Msg("http_server: sendStopStatus called")
 
+	// Update local state FIRST so getControl() returns correct status immediately
+	h.setMetadataPort(0)
+
 	result := handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
 		if n.Status.Metadata == nil {
 			n.Status.Metadata = map[string]string{}
@@ -719,6 +722,8 @@ func (h *Component) sendStopStatus(handler module.Handler) error {
 
 // sendStatus changes node and sends status if it's port enabled
 func (h *Component) sendStatus(ctx context.Context, _ StartContext, handler module.Handler) any {
+	// Update local metadataPort so getControl() returns correct status immediately
+	h.setMetadataPort(h.getListenPort())
 
 	_ = handler(ctx, v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
 
