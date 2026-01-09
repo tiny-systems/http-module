@@ -418,6 +418,7 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			h.nodeName = node.Name
 
 			listenPort, _ := strconv.Atoi(node.Status.Metadata[PortMetadata])
+			log.Info().Int("metadataPort", listenPort).Int("localPort", h.getListenPort()).Bool("isLeader", utils2.IsLeader(ctx)).Msg("http_server: ReconcilePort received")
 
 			// Leader should wait for StartPort signal for initial start
 			// BUT if port metadata is set (server was previously running), leader should
@@ -530,7 +531,9 @@ func (h *Component) getControl() Control {
 	// Use listenPort as source of truth instead of cancelFunc (isRunning)
 	// listenPort is set after server actually binds and cleared when it stops,
 	// making it reliable across all pods regardless of which one started the server
-	if h.getListenPort() > 0 {
+	port := h.getListenPort()
+	log.Info().Int("listenPort", port).Msg("http_server: getControl called")
+	if port > 0 {
 		return Control{
 			Status:     "Running",
 			ListenAddr: h.getPublicListerAddr(),
