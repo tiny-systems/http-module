@@ -517,12 +517,18 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		h.cancelFuncLock.Unlock()
 		listenPort := h.getListenPort()
 
-		// If server is already running, ignore duplicate start
-		if listenPort > 0 {
+		// If server is already running, stop it first so we can restart with proper context chain
+		// This is important because server started via ReconcilePort has context.Background()
+		// and won't receive context cancellation from signal. Restarting via StartPort
+		// establishes proper context chain for signal-based lifecycle management.
+		if listenPort > 0 || hasCancel {
 			log.Info().
 				Int("listenPort", listenPort).
-				Msg("http_server: StartPort ignored, server already running")
-			return nil
+				Bool("hasCancel", hasCancel).
+				Msg("http_server: StartPort stopping existing server to restart with new context")
+			_ = h.stop()
+			// Wait for cleanup
+			h.setListenPort(0)
 		}
 
 		// If server is in transitional state (stopping), wait for cleanup
