@@ -187,12 +187,13 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 	serverCtx, serverCancel := context.WithCancel(ctx)
 	defer serverCancel()
 
-	// Monitor parent context cancellation
+	// Monitor parent context cancellation and propagate to serverCtx
 	go func() {
 		<-ctx.Done()
 		log.Info().
 			Interface("ctxErr", ctx.Err()).
-			Msg("http-server start: parent context cancelled")
+			Msg("http-server start: parent context cancelled, stopping server")
+		serverCancel() // Cancel serverCtx when parent is cancelled
 	}()
 
 	h.setCancelFunc(serverCancel)
