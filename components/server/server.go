@@ -61,6 +61,11 @@ type Component struct {
 	metadataPortLock *sync.Mutex
 	metadataPort     int
 
+	// restartInProgress indicates server is being stopped to restart with new context
+	// When true, don't update metadata to port=0 on stop (to avoid triggering other pods to stop)
+	restartInProgress     bool
+	restartInProgressLock *sync.Mutex
+
 	nodeName string
 
 	// k8s client wrapper
@@ -71,12 +76,13 @@ func (h *Component) Instance() module.Component {
 
 	return &Component{
 		//	e:                    echo.New(),
-		publicListenAddr:     []string{},
-		publicListenAddrLock: &sync.Mutex{},
-		cancelFuncLock:       &sync.Mutex{},
-		startStopLock:        &sync.Mutex{},
-		listenPortLock:       &sync.Mutex{},
-		metadataPortLock:     &sync.Mutex{},
+		publicListenAddr:      []string{},
+		publicListenAddrLock:  &sync.Mutex{},
+		cancelFuncLock:        &sync.Mutex{},
+		startStopLock:         &sync.Mutex{},
+		listenPortLock:        &sync.Mutex{},
+		metadataPortLock:      &sync.Mutex{},
+		restartInProgressLock: &sync.Mutex{},
 		//
 		settingsLock: &sync.Mutex{},
 		//
@@ -380,7 +386,8 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 	// Only leader (listenPort==0) should update metadata when stopping
 	// Replicas (listenPort>0) just stop locally - they don't own the metadata
-	if listenPort == 0 {
+	// Skip metadata update if restart is in progress (StartPort will start a new server)
+	if listenPort == 0 && !h.isRestartInProgress() {
 		log.Info().
 			Int("currentListenPort", h.getListenPort()).
 			Msg("http-server start: leader sending stop status")
@@ -388,6 +395,8 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		if err := h.sendStopStatus(handler); err != nil {
 			log.Error().Err(err).Msg("http-server start: failed to send stop status")
 		}
+	} else if listenPort == 0 && h.isRestartInProgress() {
+		log.Info().Msg("http-server start: skipping stop status (restart in progress)")
 	} else {
 		// Replica just triggers a local status refresh (no metadata change)
 		log.Info().
@@ -436,6 +445,18 @@ func (h *Component) getMetadataPort() int {
 	h.metadataPortLock.Lock()
 	defer h.metadataPortLock.Unlock()
 	return h.metadataPort
+}
+
+func (h *Component) setRestartInProgress(v bool) {
+	h.restartInProgressLock.Lock()
+	defer h.restartInProgressLock.Unlock()
+	h.restartInProgress = v
+}
+
+func (h *Component) isRestartInProgress() bool {
+	h.restartInProgressLock.Lock()
+	defer h.restartInProgressLock.Unlock()
+	return h.restartInProgress
 }
 
 func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
@@ -545,6 +566,8 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 				Int("listenPort", listenPort).
 				Bool("hasCancel", hasCancel).
 				Msg("http_server: StartPort stopping existing server to restart with new context")
+			// Set restart flag so the stopping server doesn't update metadata to port=0
+			h.setRestartInProgress(true)
 			_ = h.stop()
 			// Wait for cleanup
 			h.setListenPort(0)
@@ -587,6 +610,9 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 		log.Info().
 			Msg("http_server: StartPort previous server stopped, starting new server")
+
+		// Clear restart flag before starting new server
+		h.setRestartInProgress(false)
 
 		// Any pod that receives StartPort starts the server directly
 		// The server will set port metadata, and other pods will sync via ReconcilePort
