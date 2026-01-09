@@ -318,6 +318,9 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 		log.Info().Int("port", actualLocalPort).Msg("HTTP server started successfully")
 
+		// Clear restart flag now that new server is bound - safe for old server cleanup to run
+		h.setRestartInProgress(false)
+
 		time.Sleep(time.Second)
 		h.setListenPort(actualLocalPort)
 
@@ -611,8 +614,8 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		log.Info().
 			Msg("http_server: StartPort previous server stopped, starting new server")
 
-		// Clear restart flag before starting new server
-		h.setRestartInProgress(false)
+		// Note: restartInProgress flag is cleared inside start() after server binds successfully
+		// This ensures the old server's cleanup doesn't send stop status while we're restarting
 
 		// Any pod that receives StartPort starts the server directly
 		// The server will set port metadata, and other pods will sync via ReconcilePort
