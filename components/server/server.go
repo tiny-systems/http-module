@@ -497,16 +497,46 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 		h.startSettings = in
 
-		// Prevent double-start: check if already running or starting
-		// cancelFunc is set immediately when start() is called
-		h.cancelFuncLock.Lock()
-		isStarting := h.cancelFunc != nil
-		h.cancelFuncLock.Unlock()
+		// Wait for any previous server to fully stop before allowing new start
+		// This prevents a race condition where the old server's cleanup hasn't completed
+		// when a new Start signal arrives (e.g., Start -> Stop -> Start cycle)
+		waitStart := time.Now()
+		maxWait := 30 * time.Second
+		for {
+			h.cancelFuncLock.Lock()
+			isStarting := h.cancelFunc != nil
+			h.cancelFuncLock.Unlock()
 
-		if h.getListenPort() > 0 || isStarting {
-			log.Info().Int("port", h.getListenPort()).Bool("isStarting", isStarting).Msg("http_server: StartPort ignored, already running/starting")
-			return nil
+			listenPort := h.getListenPort()
+			if listenPort == 0 && !isStarting {
+				// Previous server fully stopped, proceed with new start
+				break
+			}
+
+			if time.Since(waitStart) > maxWait {
+				log.Warn().
+					Int("listenPort", listenPort).
+					Bool("isStarting", isStarting).
+					Dur("waitDuration", time.Since(waitStart)).
+					Msg("http_server: StartPort timeout waiting for previous server to stop")
+				return fmt.Errorf("timeout waiting for previous server to stop")
+			}
+
+			log.Info().
+				Int("listenPort", listenPort).
+				Bool("isStarting", isStarting).
+				Msg("http_server: StartPort waiting for previous server to stop")
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
+
+		log.Info().
+			Dur("waitDuration", time.Since(waitStart)).
+			Msg("http_server: StartPort previous server stopped, starting new server")
 
 		// Any pod that receives StartPort starts the server directly
 		// The server will set port metadata, and other pods will sync via ReconcilePort
