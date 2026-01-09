@@ -510,45 +510,56 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 		h.startSettings = in
 
-		// Wait for any previous server to fully stop before allowing new start
-		// This prevents a race condition where the old server's cleanup hasn't completed
-		// when a new Start signal arrives (e.g., Start -> Stop -> Start cycle)
-		waitStart := time.Now()
-		maxWait := 30 * time.Second
-		for {
-			h.cancelFuncLock.Lock()
-			isStarting := h.cancelFunc != nil
-			h.cancelFuncLock.Unlock()
+		// Check current state
+		h.cancelFuncLock.Lock()
+		hasCancel := h.cancelFunc != nil
+		h.cancelFuncLock.Unlock()
+		listenPort := h.getListenPort()
 
-			listenPort := h.getListenPort()
-			if listenPort == 0 && !isStarting {
-				// Previous server fully stopped, proceed with new start
-				break
-			}
+		// If server is already running, ignore duplicate start
+		if listenPort > 0 {
+			log.Info().
+				Int("listenPort", listenPort).
+				Msg("http_server: StartPort ignored, server already running")
+			return nil
+		}
 
-			if time.Since(waitStart) > maxWait {
-				log.Warn().
-					Int("listenPort", listenPort).
-					Bool("isStarting", isStarting).
-					Dur("waitDuration", time.Since(waitStart)).
-					Msg("http_server: StartPort timeout waiting for previous server to stop")
-				return fmt.Errorf("timeout waiting for previous server to stop")
+		// If server is in transitional state (stopping), wait for cleanup
+		// This only applies when listenPort=0 but cancelFunc still exists
+		if hasCancel {
+			log.Info().Msg("http_server: StartPort waiting for previous server cleanup")
+			waitStart := time.Now()
+			maxWait := 30 * time.Second
+
+			for {
+				h.cancelFuncLock.Lock()
+				stillHasCancel := h.cancelFunc != nil
+				h.cancelFuncLock.Unlock()
+
+				if !stillHasCancel {
+					break
+				}
+
+				if time.Since(waitStart) > maxWait {
+					log.Warn().
+						Dur("waitDuration", time.Since(waitStart)).
+						Msg("http_server: StartPort timeout waiting for cleanup")
+					return fmt.Errorf("timeout waiting for previous server cleanup")
+				}
+
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(100 * time.Millisecond):
+				}
 			}
 
 			log.Info().
-				Int("listenPort", listenPort).
-				Bool("isStarting", isStarting).
-				Msg("http_server: StartPort waiting for previous server to stop")
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-			}
+				Dur("waitDuration", time.Since(waitStart)).
+				Msg("http_server: StartPort cleanup completed")
 		}
 
 		log.Info().
-			Dur("waitDuration", time.Since(waitStart)).
 			Msg("http_server: StartPort previous server stopped, starting new server")
 
 		// Any pod that receives StartPort starts the server directly
