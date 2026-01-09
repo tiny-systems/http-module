@@ -294,36 +294,41 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 	time.Sleep(time.Millisecond * 1500)
 
-	if e.Listener != nil {
-		if tcpAddr, ok := e.Listener.Addr().(*net.TCPAddr); ok {
-			actualLocalPort = tcpAddr.Port
+	if e.Listener == nil {
+		// Server failed to start - clear listenPort
+		log.Error().Msg("HTTP server failed to bind - listener is nil")
+		h.setListenPort(0)
+		return fmt.Errorf("server failed to bind")
+	}
 
-			log.Info().Int("port", actualLocalPort).Msg("HTTP server started successfully")
+	if tcpAddr, ok := e.Listener.Addr().(*net.TCPAddr); ok {
+		actualLocalPort = tcpAddr.Port
 
-			time.Sleep(time.Second)
-			h.setListenPort(actualLocalPort)
-			//
-			exposeCtx, exposeCancel := context.WithTimeout(ctx, time.Second*30)
-			defer exposeCancel()
+		log.Info().Int("port", actualLocalPort).Msg("HTTP server started successfully")
 
-			// upgrade
-			// hostname it's a last part of the node name
-			var autoHostName string
+		time.Sleep(time.Second)
+		h.setListenPort(actualLocalPort)
 
-			if h.startSettings.AutoHostName {
-				autoHostNameParts := strings.Split(h.nodeName, ".")
-				autoHostName = autoHostNameParts[len(autoHostNameParts)-1]
-			}
+		exposeCtx, exposeCancel := context.WithTimeout(ctx, time.Second*30)
+		defer exposeCancel()
 
-			publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
-			if err != nil {
-				log.Error().Err(err).Msg("failed to expose port")
-				// failed to expose port
-				publicURLs = []string{fmt.Sprintf("http://localhost:%d", tcpAddr.Port)}
-			}
+		// upgrade
+		// hostname it's a last part of the node name
+		var autoHostName string
 
-			h.setPublicListenAddr(publicURLs)
+		if h.startSettings.AutoHostName {
+			autoHostNameParts := strings.Split(h.nodeName, ".")
+			autoHostName = autoHostNameParts[len(autoHostNameParts)-1]
 		}
+
+		publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to expose port")
+			// failed to expose port
+			publicURLs = []string{fmt.Sprintf("http://localhost:%d", tcpAddr.Port)}
+		}
+
+		h.setPublicListenAddr(publicURLs)
 	}
 
 	// send status that we run is it is not slave
@@ -456,6 +461,10 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 			// stop if we were running
 			_ = h.stop()
+
+			// Set listenPort immediately from metadata so Ports() shows correct status
+			// before the goroutine actually starts the server
+			h.setListenPort(listenPort)
 
 			// start server with suggested port
 			go func() {
