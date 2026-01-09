@@ -372,9 +372,15 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 	h.setPublicListenAddr([]string{})
 
-	// send status when we stopped
-	if listenPort == 0 {
-		_ = h.sendStatus(context.Background(), h.startSettings.Context, handler)
+	// send status when we stopped - update metadata and trigger status refresh
+	// This applies to both leader (listenPort==0) and replicas (listenPort>0)
+	log.Info().
+		Int("listenPortParam", listenPort).
+		Int("currentListenPort", h.getListenPort()).
+		Msg("http-server start: sending stop status")
+
+	if err := h.sendStopStatus(handler); err != nil {
+		log.Error().Err(err).Msg("http-server start: failed to send stop status")
 	}
 
 	log.Info().
@@ -644,6 +650,34 @@ func (h *Component) getStatus() Status {
 		ListenAddr: h.getPublicListerAddr(),
 		IsRunning:  h.getListenPort() > 0,
 	}
+}
+
+// sendStopStatus explicitly updates metadata to port=0 and triggers a status refresh
+// This ensures the TinyNode status is updated when the server stops
+func (h *Component) sendStopStatus(handler module.Handler) error {
+	log.Info().
+		Int("listenPort", h.getListenPort()).
+		Msg("http_server: sendStopStatus called")
+
+	result := handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+		if n.Status.Metadata == nil {
+			n.Status.Metadata = map[string]string{}
+		}
+		// Explicitly set port to 0 to indicate stopped
+		n.Status.Metadata[PortMetadata] = "0"
+		log.Info().
+			Str("nodeName", n.Name).
+			Msg("http_server: sendStopStatus updating metadata to port=0")
+		return nil
+	})
+
+	if err, ok := result.(error); ok && err != nil {
+		log.Error().Err(err).Msg("http_server: sendStopStatus ReconcilePort failed")
+		return err
+	}
+
+	log.Info().Msg("http_server: sendStopStatus completed successfully")
+	return nil
 }
 
 // sendStatus changes node and sends status if it's port enabled
