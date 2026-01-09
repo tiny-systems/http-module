@@ -560,65 +560,34 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		h.cancelFuncLock.Unlock()
 		listenPort := h.getListenPort()
 
-		// If server is already running, stop it first so we can restart with proper context chain
-		// This is important because server started via ReconcilePort has context.Background()
-		// and won't receive context cancellation from signal. Restarting via StartPort
-		// establishes proper context chain for signal-based lifecycle management.
+		// If server is already running, don't restart it - just monitor the context for cancellation.
+		// Restarting on every StartPort causes a loop:
+		// 1. Signal triggers → HTTP restarts → old context cancelled
+		// 2. Signal controller sees error → doesn't update processedNonce
+		// 3. Signal triggers again → loop
+		// Instead, we keep the server running and block on the incoming context.
+		// When the signal is reset (context cancelled), we stop the server.
 		if listenPort > 0 || hasCancel {
 			log.Info().
 				Int("listenPort", listenPort).
 				Bool("hasCancel", hasCancel).
-				Msg("http_server: StartPort stopping existing server to restart with new context")
-			// Set restart flag so the stopping server doesn't update metadata to port=0
-			h.setRestartInProgress(true)
-			_ = h.stop()
-			// Wait for cleanup
-			h.setListenPort(0)
-		}
+				Msg("http_server: StartPort server already running, blocking on context")
 
-		// If server is in transitional state (stopping), wait for cleanup
-		// This only applies when listenPort=0 but cancelFunc still exists
-		if hasCancel {
-			log.Info().Msg("http_server: StartPort waiting for previous server cleanup")
-			waitStart := time.Now()
-			maxWait := 30 * time.Second
-
-			for {
-				h.cancelFuncLock.Lock()
-				stillHasCancel := h.cancelFunc != nil
-				h.cancelFuncLock.Unlock()
-
-				if !stillHasCancel {
-					break
-				}
-
-				if time.Since(waitStart) > maxWait {
-					log.Warn().
-						Dur("waitDuration", time.Since(waitStart)).
-						Msg("http_server: StartPort timeout waiting for cleanup")
-					return fmt.Errorf("timeout waiting for previous server cleanup")
-				}
-
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(100 * time.Millisecond):
-				}
-			}
+			// Block until the signal's context is cancelled (Reset button pressed)
+			<-ctx.Done()
 
 			log.Info().
-				Dur("waitDuration", time.Since(waitStart)).
-				Msg("http_server: StartPort cleanup completed")
+				Interface("ctxErr", ctx.Err()).
+				Msg("http_server: StartPort context cancelled, stopping server")
+
+			_ = h.stop()
+			return ctx.Err()
 		}
 
 		log.Info().
-			Msg("http_server: StartPort previous server stopped, starting new server")
+			Msg("http_server: StartPort starting new server")
 
-		// Note: restartInProgress flag is cleared inside start() after server binds successfully
-		// This ensures the old server's cleanup doesn't send stop status while we're restarting
-
-		// Any pod that receives StartPort starts the server directly
-		// The server will set port metadata, and other pods will sync via ReconcilePort
+		// Server not running, start it
 		return h.start(ctx, 0, handler)
 
 	case ResponsePort:
