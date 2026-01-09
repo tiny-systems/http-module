@@ -560,21 +560,24 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		h.cancelFuncLock.Unlock()
 		listenPort := h.getListenPort()
 
-		// If server is already running, return immediately without doing anything.
-		// This prevents a loop where:
-		// 1. Signal triggers → HTTP restarts → old context cancelled
-		// 2. Signal controller sees error → doesn't update processedNonce
-		// 3. Signal triggers again → loop
-		//
-		// The original start() call keeps blocking on serverCtx.Done().
-		// When signal's Reset is clicked, the signal component cancels its context,
-		// which propagates to the serverCtx and stops the server.
+		// If server is already running, block until context is cancelled.
+		// This prevents the signal controller from seeing a quick return as "done"
+		// and retrying. The server keeps running (original start() is still blocking).
+		// When signal's Reset is clicked, this context is cancelled and we return.
+		// We DON'T stop the server here - the original start() call handles that
+		// when the parent context chain is properly cancelled via Reset.
 		if listenPort > 0 || hasCancel {
 			log.Info().
 				Int("listenPort", listenPort).
 				Bool("hasCancel", hasCancel).
-				Msg("http_server: StartPort server already running, returning immediately")
-			return nil
+				Msg("http_server: StartPort server already running, blocking until context done")
+
+			<-ctx.Done()
+
+			log.Info().
+				Interface("ctxErr", ctx.Err()).
+				Msg("http_server: StartPort context cancelled, returning (server continues via original start)")
+			return ctx.Err()
 		}
 
 		log.Info().
