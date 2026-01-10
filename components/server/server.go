@@ -477,6 +477,24 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			// BUT if port metadata is set (server was previously running), leader should
 			// also start via ReconcilePort to recover after pod restart
 			if utils2.IsLeader(ctx) && listenPort == 0 {
+				// Check if we have a running server (e.g., after leadership change)
+				// If so, update metadata with our local port
+				localPort := h.getListenPort()
+				if localPort > 0 {
+					log.Info().Int("localPort", localPort).Msg("http_server: leader has running server but metadata=0, updating metadata")
+					h.setMetadataPort(localPort)
+					_ = handler(ctx, v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+						if n.Status.Metadata == nil {
+							n.Status.Metadata = map[string]string{}
+						}
+						n.Status.Metadata[PortMetadata] = fmt.Sprintf("%d", localPort)
+						// Also save config so replicas get same settings
+						if configData, err := json.Marshal(h.startSettings); err == nil {
+							n.Status.Metadata[ConfigMetadata] = string(configData)
+						}
+						return nil
+					})
+				}
 				return nil
 			}
 
