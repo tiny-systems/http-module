@@ -346,14 +346,10 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		h.setPublicListenAddr(publicURLs)
 	}
 
-	// send status that we run is it is not slave
-	if listenPort == 0 {
-		_ = h.sendStatus(ctx, h.startSettings.Context, handler)
-	} else {
-		// For replicas started via ReconcilePort, trigger a reconcile
-		// to update status display (port metadata is already correct)
-		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
-	}
+	// Always update metadata when server successfully binds
+	// This ensures metadata is correct even if an OLD start() on another pod
+	// corrupted it to port=0 during a race condition
+	_ = h.sendStatus(ctx, h.startSettings.Context, handler)
 
 	log.Info().
 		Int("listenPort", listenPort).
@@ -516,6 +512,10 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			if listenPort == h.getListenPort() {
 				return nil
 			}
+
+			// Set restartInProgress BEFORE stopping - this prevents any OLD start() that's
+			// still shutting down from setting metadata to port=0
+			h.setRestartInProgress(true)
 
 			// stop if we were running
 			_ = h.stop()
@@ -694,7 +694,16 @@ func (h *Component) getStatus() Status {
 func (h *Component) sendStopStatus(handler module.Handler) error {
 	log.Info().
 		Int("listenPort", h.getListenPort()).
+		Bool("restartInProgress", h.isRestartInProgress()).
 		Msg("http_server: sendStopStatus called")
+
+	// Double-check restartInProgress before updating metadata
+	// This provides additional protection against race conditions where
+	// a new server is being started while this old instance is shutting down
+	if h.isRestartInProgress() {
+		log.Info().Msg("http_server: sendStopStatus skipping metadata update (restart in progress)")
+		return nil
+	}
 
 	// Update local state FIRST so getControl() returns correct status immediately
 	h.setMetadataPort(0)
