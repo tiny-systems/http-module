@@ -554,40 +554,55 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 		h.startSettings = in
 
-		// Use startStopLock to prevent race with ReconcilePort stop/start sequence
-		// Without this lock, StartPort can check state while ReconcilePort is in the
-		// middle of stopping the server (cancelFunc not yet nil, listenPort not yet 0)
-		// and incorrectly think the server is still running
-		h.startStopLock.Lock()
+		// Loop until server state is stable (either fully running or fully stopped)
+		// This prevents a race where we see cancelFunc!=nil during shutdown
+		// and incorrectly block on ctx.Done() instead of starting a new server
+		for {
+			h.startStopLock.Lock()
 
-		// Check current state
-		h.cancelFuncLock.Lock()
-		hasCancel := h.cancelFunc != nil
-		h.cancelFuncLock.Unlock()
-		listenPort := h.getListenPort()
+			h.cancelFuncLock.Lock()
+			hasCancel := h.cancelFunc != nil
+			h.cancelFuncLock.Unlock()
+			listenPort := h.getListenPort()
 
-		// If server is already running, block until context is cancelled.
-		// This prevents the signal controller from seeing a quick return as "done"
-		// and retrying. The server keeps running (original start() is still blocking).
-		// When signal's Reset is clicked, this context is cancelled and we return.
-		// We DON'T stop the server here - the original start() call handles that
-		// when the parent context chain is properly cancelled via Reset.
-		if listenPort > 0 || hasCancel {
+			// Server is fully running - block until this signal's context is cancelled
+			if listenPort > 0 && hasCancel {
+				h.startStopLock.Unlock()
+				log.Info().
+					Int("listenPort", listenPort).
+					Bool("hasCancel", hasCancel).
+					Msg("http_server: StartPort server running, blocking until context done")
+
+				<-ctx.Done()
+
+				log.Info().
+					Interface("ctxErr", ctx.Err()).
+					Msg("http_server: StartPort context cancelled, returning")
+				return ctx.Err()
+			}
+
+			// Server is fully stopped - proceed to start
+			if !hasCancel && listenPort == 0 {
+				h.startStopLock.Unlock()
+				break
+			}
+
+			// Server is in transitional state (starting up or shutting down)
+			// Release lock and wait before checking again
 			h.startStopLock.Unlock()
+
 			log.Info().
 				Int("listenPort", listenPort).
 				Bool("hasCancel", hasCancel).
-				Msg("http_server: StartPort server already running, blocking until context done")
+				Msg("http_server: StartPort server in transitional state, waiting")
 
-			<-ctx.Done()
-
-			log.Info().
-				Interface("ctxErr", ctx.Err()).
-				Msg("http_server: StartPort context cancelled, returning (server continues via original start)")
-			return ctx.Err()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+				// Check again
+			}
 		}
-
-		h.startStopLock.Unlock()
 
 		log.Info().
 			Msg("http_server: StartPort starting new server")
