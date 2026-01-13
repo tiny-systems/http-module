@@ -13,7 +13,10 @@ require (
 	github.com/spf13/cobra v1.10.1
 	github.com/spf13/viper v1.19.0
 	github.com/swaggest/jsonschema-go v0.3.70
-	github.com/tiny-systems/module v0.1.205
+	github.com/tiny-systems/module v0.1.206-0.20260113194124-90ea7c6669f3
+	k8s.io/api v0.34.0
+	k8s.io/apimachinery v0.34.0
+	sigs.k8s.io/controller-runtime v0.19.0
 )
 
 require (
@@ -188,9 +191,7 @@ require (
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	helm.sh/helm/v3 v3.19.0 // indirect
-	k8s.io/api v0.34.0 // indirect
 	k8s.io/apiextensions-apiserver v0.34.0 // indirect
-	k8s.io/apimachinery v0.34.0 // indirect
 	k8s.io/apiserver v0.34.0 // indirect
 	k8s.io/cli-runtime v0.34.0 // indirect
 	k8s.io/client-go v0.34.0 // indirect
@@ -200,7 +201,6 @@ require (
 	k8s.io/kubectl v0.34.0 // indirect
 	k8s.io/utils v0.0.0-20250604170112-4c0f3b243397 // indirect
 	oras.land/oras-go/v2 v2.6.0 // indirect
-	sigs.k8s.io/controller-runtime v0.19.0 // indirect
 	sigs.k8s.io/json v0.0.0-20241014173422-cfa47c3a1cc8 // indirect
 	sigs.k8s.io/kustomize/api v0.20.1 // indirect
 	sigs.k8s.io/kustomize/kyaml v0.20.1 // indirect
