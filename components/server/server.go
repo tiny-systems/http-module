@@ -5,14 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/labstack/echo/v4"
-	"github.com/rs/zerolog/log"
-	"github.com/tiny-systems/http-module/components/etc"
-	"github.com/tiny-systems/http-module/pkg/utils"
-	"github.com/tiny-systems/module/api/v1alpha1"
-	"github.com/tiny-systems/module/module"
-	utils2 "github.com/tiny-systems/module/pkg/utils"
-	"github.com/tiny-systems/module/registry"
 	"io"
 	"net"
 	"net/http"
@@ -23,6 +15,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/labstack/echo/v4"
+	"github.com/rs/zerolog/log"
+	"github.com/tiny-systems/http-module/components/etc"
+	"github.com/tiny-systems/http-module/components/server/portmanager"
+	"github.com/tiny-systems/http-module/pkg/utils"
+	"github.com/tiny-systems/module/api/v1alpha1"
+	"github.com/tiny-systems/module/module"
+	utils2 "github.com/tiny-systems/module/pkg/utils"
+	"github.com/tiny-systems/module/registry"
 )
 
 const (
@@ -68,8 +70,8 @@ type Component struct {
 
 	nodeName string
 
-	// k8s client wrapper
-	client module.Client
+	// port manager for exposing/disclosing ports via K8s Service/Ingress
+	portMgr *portmanager.Manager
 }
 
 func (h *Component) Instance() module.Component {
@@ -182,8 +184,8 @@ func (h *Component) isRunning() bool {
 // listenPort > 0 means it is slave
 func (h *Component) start(ctx context.Context, listenPort int, handler module.Handler) error {
 	//
-	if h.client == nil {
-		return fmt.Errorf("unable to start, no client available")
+	if h.portMgr == nil {
+		return fmt.Errorf("unable to start, no port manager available")
 	}
 
 	log.Info().
@@ -336,7 +338,7 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 			autoHostName = autoHostNameParts[len(autoHostNameParts)-1]
 		}
 
-		publicURLs, err := h.client.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
+		publicURLs, err := h.portMgr.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to expose port")
 			// failed to expose port
@@ -378,7 +380,7 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		discloseCtx, discloseCancel := context.WithTimeout(context.Background(), time.Second*30)
 		defer discloseCancel()
 
-		_ = h.client.DisclosePort(discloseCtx, actualLocalPort)
+		_ = h.portMgr.DisclosePort(discloseCtx, actualLocalPort)
 	}
 
 	h.setPublicListenAddr([]string{})
@@ -551,7 +553,10 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		}
 
 	case v1alpha1.ClientPort:
-		h.client, _ = msg.(module.Client)
+		// Extract raw K8s client and create local port manager
+		if k8sProvider, ok := msg.(module.K8sClient); ok {
+			h.portMgr = portmanager.New(k8sProvider.GetK8sClient(), k8sProvider.GetNamespace())
+		}
 
 	case v1alpha1.SettingsPort:
 		in, ok := msg.(Settings)
