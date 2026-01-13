@@ -10,6 +10,8 @@ import (
 	_ "github.com/tiny-systems/http-module/components/client"
 	_ "github.com/tiny-systems/http-module/components/server"
 	"github.com/tiny-systems/module/cli"
+	"github.com/tiny-systems/module/module"
+	"github.com/tiny-systems/module/registry"
 	"os"
 	"os/signal"
 	"syscall"
@@ -31,6 +33,13 @@ func main() {
 	if viper.GetBool("debug") {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
+
+	// Declare RBAC requirements for http-module (needs pods, services, ingresses for ExposePort)
+	registry.SetRequirements(module.Requirements{
+		RBAC: module.RBACRequirements{
+			EnableKubernetesResourceAccess: true,
+		},
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
