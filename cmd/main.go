@@ -34,10 +34,26 @@ func main() {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
 
-	// Declare RBAC requirements for http-module (needs pods, services, ingresses for ExposePort)
+	// Declare RBAC requirements for http-module (ExposePort functionality)
 	registry.SetRequirements(module.Requirements{
 		RBAC: module.RBACRequirements{
-			EnableKubernetesResourceAccess: true,
+			ExtraRules: []module.RBACRule{
+				{
+					APIGroups: []string{""},
+					Resources: []string{"pods"},
+					Verbs:     []string{"get"},
+				},
+				{
+					APIGroups: []string{""},
+					Resources: []string{"services"},
+					Verbs:     []string{"get", "list", "update"},
+				},
+				{
+					APIGroups: []string{"networking.k8s.io"},
+					Resources: []string{"ingresses"},
+					Verbs:     []string{"get", "list", "update"},
+				},
+			},
 		},
 	})
 
