@@ -23,7 +23,7 @@ import (
 	"github.com/tiny-systems/http-module/pkg/utils"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
-	utils2 "github.com/tiny-systems/module/pkg/utils"
+	moduleutils "github.com/tiny-systems/module/pkg/utils"
 	"github.com/tiny-systems/module/registry"
 )
 
@@ -32,63 +32,57 @@ const (
 	ResponsePort         = "response"
 	RequestPort          = "request"
 	StartPort            = "start"
+	StopPort             = "stop"
 	StatusPort           = "status"
 )
 
-const (
-	PortMetadata   = "http-server-port"
-	ConfigMetadata = "http-server-config"
-)
+// State represents HTTP server runtime state stored in TinyState
+// Presence of TinyState means server should be running, absence means stopped
+type State struct {
+	Port       int    `json:"port,omitempty"`
+	Config     Start  `json:"config,omitempty"`
+	SourceNode string `json:"sourceNode,omitempty"` // node that triggered Start (for ownership)
+}
 
 type Component struct {
-	//e            *echo.Echo
 	settings     Settings
 	settingsLock *sync.Mutex
-	//
+
 	startSettings Start
 
-	publicListenAddrLock *sync.Mutex
+	publicListenAddrLock *sync.RWMutex
 	publicListenAddr     []string
-	//listenPort           int
 
 	cancelFunc     context.CancelFunc
 	cancelFuncLock *sync.Mutex
 
-	startStopLock *sync.Mutex // Protects start/stop sequence to prevent races
+	startStopLock *sync.Mutex
 
-	listenPortLock *sync.Mutex
+	listenPortLock *sync.RWMutex
 	listenPort     int
 
-	// metadataPort is synced from TinyNode metadata - source of truth for multi-pod status
-	metadataPortLock *sync.Mutex
-	metadataPort     int
+	// State synced from TinyState - source of truth for multi-pod status
+	stateLock *sync.RWMutex
+	state     State
+	hasState  bool // true when TinyState exists (server should be running)
 
-	// restartInProgress indicates server is being stopped to restart with new context
-	// When true, don't update metadata to port=0 on stop (to avoid triggering other pods to stop)
-	restartInProgress     bool
-	restartInProgressLock *sync.Mutex
-
-	nodeName string
+	nodeName   string
+	sourceNode string // node that triggered Start (for ownership)
+	handler    module.Handler
 
 	// port manager for exposing/disclosing ports via K8s Service/Ingress
 	portMgr *portmanager.Manager
 }
 
 func (h *Component) Instance() module.Component {
-
 	return &Component{
-		//	e:                    echo.New(),
-		publicListenAddr:      []string{},
-		publicListenAddrLock:  &sync.Mutex{},
-		cancelFuncLock:        &sync.Mutex{},
-		startStopLock:         &sync.Mutex{},
-		listenPortLock:        &sync.Mutex{},
-		metadataPortLock:      &sync.Mutex{},
-		restartInProgressLock: &sync.Mutex{},
-		//
-		settingsLock: &sync.Mutex{},
-		//
-
+		publicListenAddr:     []string{},
+		publicListenAddrLock: &sync.RWMutex{},
+		cancelFuncLock:       &sync.Mutex{},
+		startStopLock:        &sync.Mutex{},
+		listenPortLock:       &sync.RWMutex{},
+		stateLock:            &sync.RWMutex{},
+		settingsLock:         &sync.Mutex{},
 		startSettings: Start{
 			WriteTimeout: 10,
 			ReadTimeout:  60,
@@ -109,7 +103,7 @@ type StartContext any
 type Start struct {
 	Context      StartContext `json:"context,omitempty" configurable:"true" title:"Context" description:"Start context"`
 	AutoHostName bool         `json:"autoHostName" title:"Automatically generate hostname" description:"Use cluster auto subdomain setup if any."`
-	Hostnames    []string     `json:"hostnames,omitempty" title:"Hostnames"  description:"List of virtual host this server should be bound to."` //requiredWhen:"['kind', 'equal', 'enum 1']"
+	Hostnames    []string     `json:"hostnames,omitempty" title:"Hostnames"  description:"List of virtual host this server should be bound to."`
 	ReadTimeout  int          `json:"readTimeout" required:"true" title:"Read Timeout" description:"Read timeout is the maximum duration for reading the entire request in seconds, including the body. A zero or negative value means there will be no timeout."`
 	WriteTimeout int          `json:"writeTimeout" required:"true" title:"Write Timeout" description:"Write timeout is the maximum duration before timing out writes of the response in seconds. It is reset whenever a new request's header is read."`
 }
@@ -160,7 +154,6 @@ func (h *Component) stop() error {
 	if h.cancelFunc == nil {
 		return nil
 	}
-	// stop with no error
 	log.Info().Msg("stopping HTTP server")
 	h.cancelFunc()
 	return nil
@@ -175,23 +168,15 @@ func (h *Component) setCancelFunc(causeFunc context.CancelFunc) {
 func (h *Component) isRunning() bool {
 	h.cancelFuncLock.Lock()
 	defer h.cancelFuncLock.Unlock()
-
 	return h.cancelFunc != nil
 }
 
-// start
-// listenPort == master
-// listenPort > 0 means it is slave
-func (h *Component) start(ctx context.Context, listenPort int, handler module.Handler) error {
-	//
+func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	if h.portMgr == nil {
 		return fmt.Errorf("unable to start, no port manager available")
 	}
 
-	log.Info().
-		Int("listenPort", listenPort).
-		Interface("ctxErrOnEntry", ctx.Err()).
-		Msg("http-server start: entering")
+	log.Info().Msg("http-server start: entering")
 
 	e := echo.New()
 	e.HideBanner = true
@@ -200,20 +185,15 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 	serverCtx, serverCancel := context.WithCancel(ctx)
 	defer serverCancel()
 
-	// Monitor parent context cancellation and propagate to serverCtx
 	go func() {
 		<-ctx.Done()
-		log.Info().
-			Interface("ctxErr", ctx.Err()).
-			Msg("http-server start: parent context cancelled, stopping server")
-		serverCancel() // Cancel serverCtx when parent is cancelled
+		log.Info().Msg("http-server start: parent context cancelled, stopping server")
+		serverCancel()
 	}()
 
 	h.setCancelFunc(serverCancel)
 
-	//
 	e.Any("*", func(c echo.Context) error {
-
 		requestResult := Request{
 			Context:       h.startSettings.Context,
 			Host:          c.Request().Host,
@@ -241,11 +221,14 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 			}
 		}
 
-		body, _ := io.ReadAll(req.Body)
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return fmt.Errorf("read request body: %w", err)
+		}
 		requestResult.Body = utils.BytesToString(body)
 
 		resp := handler(c.Request().Context(), RequestPort, requestResult)
-		if err := utils2.CheckForError(resp); err != nil {
+		if err := moduleutils.CheckForError(resp); err != nil {
 			return err
 		}
 
@@ -268,40 +251,28 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 	e.Server.ReadTimeout = time.Duration(h.startSettings.ReadTimeout) * time.Second
 	e.Server.WriteTimeout = time.Duration(h.startSettings.WriteTimeout) * time.Second
 
-	var (
-		actualLocalPort int
-	)
+	var actualLocalPort int
+	var listenPort int
 
-	if listenPort == 0 && len(h.startSettings.Hostnames) == 1 {
-		// try to use user defined port as suggested
+	if len(h.startSettings.Hostnames) == 1 {
 		portParts := strings.Split(h.startSettings.Hostnames[0], ":")
 		if len(portParts) == 2 {
-			// we have single hostname defined with explicit port defined, try parse it and use it
 			if port, err := strconv.Atoi(portParts[1]); err == nil {
 				listenPort = port
 			}
 		}
 	}
 
-	// auto suggested port
 	var listenAddr = ":0"
-
 	if listenPort > 0 {
-		// if port suggested we listen to it
 		listenAddr = fmt.Sprintf(":%d", listenPort)
 	}
 
 	go func() {
 		err := e.Start(listenAddr)
-
-		if err == nil {
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			return
 		}
-
-		if errors.Is(err, http.ErrServerClosed) {
-			return
-		}
-
 		log.Error().Err(err).Int("port", listenPort).Msg("failed to start HTTP server")
 		serverCancel()
 	}()
@@ -309,7 +280,6 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 	time.Sleep(time.Millisecond * 1500)
 
 	if e.Listener == nil {
-		// Server failed to start - clear listenPort
 		log.Error().Msg("HTTP server failed to bind - listener is nil")
 		h.setListenPort(0)
 		return fmt.Errorf("server failed to bind")
@@ -317,11 +287,7 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 	if tcpAddr, ok := e.Listener.Addr().(*net.TCPAddr); ok {
 		actualLocalPort = tcpAddr.Port
-
 		log.Info().Int("port", actualLocalPort).Msg("HTTP server started successfully")
-
-		// Clear restart flag now that new server is bound - safe for old server cleanup to run
-		h.setRestartInProgress(false)
 
 		time.Sleep(time.Second)
 		h.setListenPort(actualLocalPort)
@@ -329,11 +295,8 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		exposeCtx, exposeCancel := context.WithTimeout(ctx, time.Second*30)
 		defer exposeCancel()
 
-		// upgrade
-		// hostname it's a last part of the node name
 		var autoHostName string
-
-		if h.startSettings.AutoHostName {
+		if h.startSettings.AutoHostName || len(h.startSettings.Hostnames) == 0 {
 			autoHostNameParts := strings.Split(h.nodeName, ".")
 			autoHostName = autoHostNameParts[len(autoHostNameParts)-1]
 		}
@@ -341,31 +304,26 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 		publicURLs, err := h.portMgr.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to expose port")
-			// failed to expose port
 			publicURLs = []string{fmt.Sprintf("http://localhost:%d", tcpAddr.Port)}
 		}
 
 		h.setPublicListenAddr(publicURLs)
+
+		// Update state with actual port (keep same owner)
+		h.writeState(handler, State{
+			Port:       actualLocalPort,
+			Config:     h.startSettings,
+			SourceNode: h.sourceNode,
+		}, h.sourceNode)
 	}
 
-	// Always update metadata when server successfully binds
-	// This ensures metadata is correct even if an OLD start() on another pod
-	// corrupted it to port=0 during a race condition
-	_ = h.sendStatus(ctx, h.startSettings.Context, handler)
+	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 
-	log.Info().
-		Int("listenPort", listenPort).
-		Msg("http-server start: waiting on serverCtx.Done()")
-
-	// ask to reconcile (redraw the component)
+	log.Info().Msg("http-server start: waiting on serverCtx.Done()")
 
 	<-serverCtx.Done()
 
-	log.Info().
-		Int("listenPort", listenPort).
-		Interface("serverCtxErr", serverCtx.Err()).
-		Interface("parentCtxErr", ctx.Err()).
-		Msg("http-server start: serverCtx done, shutting down")
+	log.Info().Msg("http-server start: serverCtx done, shutting down")
 
 	shutdownCtx, shutDownCancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer shutDownCancel()
@@ -374,41 +332,16 @@ func (h *Component) start(ctx context.Context, listenPort int, handler module.Ha
 
 	h.setCancelFunc(nil)
 	h.setListenPort(0)
-	//
 
 	if actualLocalPort > 0 {
 		discloseCtx, discloseCancel := context.WithTimeout(context.Background(), time.Second*30)
 		defer discloseCancel()
-
 		_ = h.portMgr.DisclosePort(discloseCtx, actualLocalPort)
 	}
 
 	h.setPublicListenAddr([]string{})
 
-	// Only leader (listenPort==0) should update metadata when stopping
-	// Replicas (listenPort>0) just stop locally - they don't own the metadata
-	// Skip metadata update if restart is in progress (StartPort will start a new server)
-	if listenPort == 0 && !h.isRestartInProgress() {
-		log.Info().
-			Int("currentListenPort", h.getListenPort()).
-			Msg("http-server start: leader sending stop status")
-
-		if err := h.sendStopStatus(handler); err != nil {
-			log.Error().Err(err).Msg("http-server start: failed to send stop status")
-		}
-	} else if listenPort == 0 && h.isRestartInProgress() {
-		log.Info().Msg("http-server start: skipping stop status (restart in progress)")
-	} else {
-		// Replica just triggers a local status refresh (no metadata change)
-		log.Info().
-			Int("listenPortParam", listenPort).
-			Msg("http-server start: replica stopped, triggering local status refresh")
-		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
-	}
-
-	log.Info().
-		Int("listenPort", listenPort).
-		Msg("http-server start: exiting")
+	log.Info().Msg("http-server start: exiting")
 
 	return serverCtx.Err()
 }
@@ -424,136 +357,116 @@ func (h *Component) setListenPort(port int) {
 	defer h.listenPortLock.Unlock()
 	h.listenPort = port
 }
+
 func (h *Component) getListenPort() int {
-	h.listenPortLock.Lock()
-	defer h.listenPortLock.Unlock()
+	h.listenPortLock.RLock()
+	defer h.listenPortLock.RUnlock()
 	return h.listenPort
 }
 
 func (h *Component) getPublicListerAddr() []string {
-	h.publicListenAddrLock.Lock()
-	defer h.publicListenAddrLock.Unlock()
+	h.publicListenAddrLock.RLock()
+	defer h.publicListenAddrLock.RUnlock()
 	return h.publicListenAddr
 }
 
-func (h *Component) setMetadataPort(port int) {
-	h.metadataPortLock.Lock()
-	defer h.metadataPortLock.Unlock()
-	h.metadataPort = port
+func (h *Component) getState() (State, bool) {
+	h.stateLock.RLock()
+	defer h.stateLock.RUnlock()
+	return h.state, h.hasState
 }
 
-func (h *Component) getMetadataPort() int {
-	h.metadataPortLock.Lock()
-	defer h.metadataPortLock.Unlock()
-	return h.metadataPort
+func (h *Component) writeState(handler module.Handler, state State, ownerNode string) error {
+	stateData, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+
+	result := handler(context.Background(), v1alpha1.ReconcilePort, v1alpha1.StateUpdate{
+		Data:      stateData,
+		OwnerNode: ownerNode,
+	})
+
+	return moduleutils.CheckForError(result)
 }
 
-func (h *Component) setRestartInProgress(v bool) {
-	h.restartInProgressLock.Lock()
-	defer h.restartInProgressLock.Unlock()
-	h.restartInProgress = v
-}
-
-func (h *Component) isRestartInProgress() bool {
-	h.restartInProgressLock.Lock()
-	defer h.restartInProgressLock.Unlock()
-	return h.restartInProgress
+// deleteState deletes the TinyState CRD (nil Data signals deletion)
+func (h *Component) deleteState(handler module.Handler) error {
+	result := handler(context.Background(), v1alpha1.ReconcilePort, v1alpha1.StateUpdate{
+		Data: nil,
+	})
+	return moduleutils.CheckForError(result)
 }
 
 func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
+	h.handler = handler
 
 	switch port {
 	case v1alpha1.ReconcilePort:
-
 		if node, ok := msg.(v1alpha1.TinyNode); ok {
-			//
-			// all replicas should get copy of same node
 			h.nodeName = node.Name
+		}
+		return nil
 
-			listenPort, _ := strconv.Atoi(node.Status.Metadata[PortMetadata])
-			// Sync metadata port for all pods - this is the source of truth for status display
-			h.setMetadataPort(listenPort)
-			log.Info().Int("metadataPort", listenPort).Int("localPort", h.getListenPort()).Bool("isLeader", utils2.IsLeader(ctx)).Msg("http_server: ReconcilePort received")
-
-			// Leader should wait for StartPort signal for initial start
-			// BUT if port metadata is set (server was previously running), leader should
-			// also start via ReconcilePort to recover after pod restart
-			if utils2.IsLeader(ctx) && listenPort == 0 {
-				// Check if we have a running server (e.g., after leadership change)
-				// If so, update metadata with our local port
-				localPort := h.getListenPort()
-				if localPort > 0 {
-					log.Info().Int("localPort", localPort).Msg("http_server: leader has running server but metadata=0, updating metadata")
-					h.setMetadataPort(localPort)
-					_ = handler(ctx, v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
-						if n.Status.Metadata == nil {
-							n.Status.Metadata = map[string]string{}
-						}
-						n.Status.Metadata[PortMetadata] = fmt.Sprintf("%d", localPort)
-						// Also save config so replicas get same settings
-						if configData, err := json.Marshal(h.startSettings); err == nil {
-							n.Status.Metadata[ConfigMetadata] = string(configData)
-						}
-						return nil
-					})
-				}
-				return nil
-			}
-
-			if listenPort == h.getListenPort() {
-				// it is the same instance
-				return nil
-			}
-
-			if listenPort == 0 {
-				// Port is 0 - either not assigned yet, or server should stop
-				if h.getListenPort() > 0 {
-					// Server is running but metadata says stop - stop the server
-					log.Info().Msg("http_server: ReconcilePort detected port=0, stopping server")
-					_ = h.stop()
-				}
-				return nil
-			}
-
-			// Restore startSettings from metadata if available
-			// This ensures replicas get the same config (including Context) as the leader
-			if configData, ok := node.Status.Metadata[ConfigMetadata]; ok && configData != "" {
-				var savedConfig Start
-				if err := json.Unmarshal([]byte(configData), &savedConfig); err == nil {
-					h.startSettings = savedConfig
-				}
-			}
-
-			// Protect stop/start sequence to prevent races
-			h.startStopLock.Lock()
-			defer h.startStopLock.Unlock()
-
-			// Double-check after acquiring lock (another goroutine might have started)
-			if listenPort == h.getListenPort() {
-				return nil
-			}
-
-			// Set restartInProgress BEFORE stopping - this prevents any OLD start() that's
-			// still shutting down from setting metadata to port=0
-			h.setRestartInProgress(true)
-
-			// stop if we were running
-			_ = h.stop()
-
-			// Set listenPort immediately from metadata so Ports() shows correct status
-			// before the goroutine actually starts the server
-			h.setListenPort(listenPort)
-
-			// start server with suggested port
-			go func() {
-				// @todo best effort to start server in background
-				_ = h.start(context.Background(), listenPort, handler)
-			}()
-
+	case v1alpha1.StatePort:
+		// Receive state data as []byte
+		// nil means state was deleted (stop)
+		data, ok := msg.([]byte)
+		if !ok {
+			return fmt.Errorf("invalid state message: expected []byte")
 		}
 
+		// nil data means state was deleted - stop server
+		if data == nil {
+			log.Info().
+				Bool("isLeader", moduleutils.IsLeader(ctx)).
+				Msg("http_server: state deleted, stopping")
+
+			// Reset local state
+			h.stateLock.Lock()
+			h.state = State{}
+			h.hasState = false
+			h.stateLock.Unlock()
+
+			// Only leader stops the server
+			if moduleutils.IsLeader(ctx) {
+				_ = h.stop()
+			}
+			return nil
+		}
+
+		// Parse state data - presence means server should run
+		var serverState State
+		if err := json.Unmarshal(data, &serverState); err != nil {
+			log.Error().Err(err).Msg("http_server: failed to unmarshal state")
+			return err
+		}
+
+		log.Info().
+			Int("statePort", serverState.Port).
+			Str("sourceNode", serverState.SourceNode).
+			Bool("isLeader", moduleutils.IsLeader(ctx)).
+			Int("localPort", h.getListenPort()).
+			Msg("http_server: received state, server should run")
+
+		// Update local state for UI display
+		h.stateLock.Lock()
+		h.state = serverState
+		h.hasState = true
+		h.stateLock.Unlock()
+
+		// Restore config and source from state
+		h.startSettings = serverState.Config
+		h.sourceNode = serverState.SourceNode
+
+		// Note: We do NOT start the server here.
+		// Server is started by blocking StartPort call from Signal.
+		// _state only updates local state and stops server on nil.
+		// On recovery, Signal will re-call StartPort which starts the server.
+
+		return nil
+
 	case v1alpha1.ClientPort:
-		// Extract raw K8s client and create local port manager
 		if k8sProvider, ok := msg.(module.K8sClient); ok {
 			h.portMgr = portmanager.New(k8sProvider.GetK8sClient(), k8sProvider.GetNamespace())
 		}
@@ -563,10 +476,8 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		if !ok {
 			return fmt.Errorf("invalid settings message")
 		}
-
 		h.settingsLock.Lock()
 		defer h.settingsLock.Unlock()
-
 		h.settings = in
 
 	case StartPort:
@@ -575,70 +486,72 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			return fmt.Errorf("invalid start message")
 		}
 
-		h.startSettings = in
-
-		// Loop until server state is stable (either fully running or fully stopped)
-		// This prevents a race where we see cancelFunc!=nil during shutdown
-		// and incorrectly block on ctx.Done() instead of starting a new server
-		for {
-			h.startStopLock.Lock()
-
-			h.cancelFuncLock.Lock()
-			hasCancel := h.cancelFunc != nil
-			h.cancelFuncLock.Unlock()
-			listenPort := h.getListenPort()
-
-			// Server is fully running - block until this signal's context is cancelled
-			if listenPort > 0 && hasCancel {
-				h.startStopLock.Unlock()
-				log.Info().
-					Int("listenPort", listenPort).
-					Bool("hasCancel", hasCancel).
-					Msg("http_server: StartPort server running, blocking until context done")
-
-				<-ctx.Done()
-
-				log.Info().
-					Interface("ctxErr", ctx.Err()).
-					Msg("http_server: StartPort context cancelled, returning")
-				return ctx.Err()
-			}
-
-			// Server is fully stopped - proceed to start
-			if !hasCancel && listenPort == 0 {
-				h.startStopLock.Unlock()
-				break
-			}
-
-			// Server is in transitional state (starting up or shutting down)
-			// Release lock and wait before checking again
-			h.startStopLock.Unlock()
-
-			log.Info().
-				Int("listenPort", listenPort).
-				Bool("hasCancel", hasCancel).
-				Msg("http_server: StartPort server in transitional state, waiting")
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-				// Check again
-			}
+		// Only leader processes start commands
+		if !moduleutils.IsLeader(ctx) {
+			return nil
 		}
 
-		log.Info().
-			Msg("http_server: StartPort starting new server")
+		// Get source node from context for ownership
+		sourceNode := moduleutils.GetSourceNode(ctx)
+		h.sourceNode = sourceNode
+		h.startSettings = in
 
-		// Server not running, start it
-		return h.start(ctx, 0, handler)
+		log.Info().
+			Str("sourceNode", sourceNode).
+			Msg("http_server: StartPort received, writing state for crash recovery")
+
+		// Write state with owner - for crash recovery and cascade delete
+		if err := h.writeState(handler, State{
+			Config:     in,
+			SourceNode: sourceNode,
+		}, sourceNode); err != nil {
+			log.Error().Err(err).Msg("http_server: failed to write start state")
+			return err
+		}
+
+		// Trigger reconcile to update UI
+		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
+
+		// BLOCK while server runs - this is the blocking API
+		log.Info().Msg("http_server: StartPort blocking while server runs")
+		err := h.start(ctx, handler)
+
+		// If we reach here, server stopped (ctx cancelled, error, or natural stop)
+		// Delete state - crash recovery not needed for clean exit
+		log.Info().
+			Err(err).
+			Msg("http_server: StartPort unblocked, deleting state")
+		h.deleteState(handler)
+
+		// Trigger reconcile to update UI
+		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
+
+		return err
+
+	case StopPort:
+		// Only leader processes stop commands
+		if !moduleutils.IsLeader(ctx) {
+			return nil
+		}
+
+		log.Info().Msg("http_server: StopPort received, deleting state")
+
+		// Delete state - this will trigger _state port with nil which stops the server
+		if err := h.deleteState(handler); err != nil {
+			log.Error().Err(err).Msg("http_server: failed to delete state")
+			return err
+		}
+
+		// Trigger reconcile to update UI
+		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
+
+		return nil // Don't block - state deletion will stop server
 
 	case ResponsePort:
 		in, ok := msg.(Response)
 		if !ok {
 			return fmt.Errorf("invalid response message")
 		}
-		// we return response as final destination reached
 		return in
 
 	default:
@@ -649,11 +562,8 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 }
 
 func (h *Component) getControl() Control {
-	// Use metadataPort as source of truth - synced from TinyNode metadata
-	// This ensures consistent status display across all pods in multi-replica setup
-	port := h.getMetadataPort()
-	log.Info().Int("metadataPort", port).Int("localPort", h.getListenPort()).Msg("http_server: getControl called")
-	if port > 0 {
+	state, hasState := h.getState()
+	if hasState && state.Port > 0 {
 		return Control{
 			Status:     "Running",
 			ListenAddr: h.getPublicListerAddr(),
@@ -665,20 +575,22 @@ func (h *Component) getControl() Control {
 }
 
 func (h *Component) Ports() []module.Port {
-
 	h.settingsLock.Lock()
 	defer h.settingsLock.Unlock()
 
+	_, hasState := h.getState()
+
 	ports := []module.Port{
-		// receive client first
 		{
-			Name: v1alpha1.ClientPort, // to receive k8s client wrapper
+			Name: v1alpha1.ClientPort,
 		},
-
 		{
-			Name: v1alpha1.ReconcilePort, // to receive TinyNode instance
+			Name: v1alpha1.ReconcilePort,
 		},
-
+		{
+			Name: v1alpha1.StatePort,
+			// Hidden port - receives TinyState for state sync
+		},
 		{
 			Name:          v1alpha1.SettingsPort,
 			Label:         "Settings",
@@ -708,14 +620,21 @@ func (h *Component) Ports() []module.Port {
 		},
 	}
 
-	ports = append(ports, module.Port{
-		Name:          StartPort,
-		Label:         "Start",
-		Position:      module.Left,
-		Configuration: h.startSettings,
-	})
-
-	// programmatically use status in flows
+	// Show Start when not running, Stop when running
+	if hasState {
+		ports = append(ports, module.Port{
+			Name:     StopPort,
+			Label:    "Stop",
+			Position: module.Left,
+		})
+	} else {
+		ports = append(ports, module.Port{
+			Name:          StartPort,
+			Label:         "Start",
+			Position:      module.Left,
+			Configuration: h.startSettings,
+		})
+	}
 
 	if h.settings.EnableStatusPort {
 		ports = append(ports, module.Port{
@@ -730,77 +649,11 @@ func (h *Component) Ports() []module.Port {
 }
 
 func (h *Component) getStatus() Status {
+	state, hasState := h.getState()
 	return Status{
 		ListenAddr: h.getPublicListerAddr(),
-		IsRunning:  h.getListenPort() > 0,
+		IsRunning:  hasState && state.Port > 0,
 	}
-}
-
-// sendStopStatus explicitly updates metadata to port=0 and triggers a status refresh
-// This ensures the TinyNode status is updated when the server stops
-func (h *Component) sendStopStatus(handler module.Handler) error {
-	log.Info().
-		Int("listenPort", h.getListenPort()).
-		Bool("restartInProgress", h.isRestartInProgress()).
-		Msg("http_server: sendStopStatus called")
-
-	// Double-check restartInProgress before updating metadata
-	// This provides additional protection against race conditions where
-	// a new server is being started while this old instance is shutting down
-	if h.isRestartInProgress() {
-		log.Info().Msg("http_server: sendStopStatus skipping metadata update (restart in progress)")
-		return nil
-	}
-
-	// Update local state FIRST so getControl() returns correct status immediately
-	h.setMetadataPort(0)
-
-	result := handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
-		if n.Status.Metadata == nil {
-			n.Status.Metadata = map[string]string{}
-		}
-		// Explicitly set port to 0 to indicate stopped
-		n.Status.Metadata[PortMetadata] = "0"
-		log.Info().
-			Str("nodeName", n.Name).
-			Msg("http_server: sendStopStatus updating metadata to port=0")
-		return nil
-	})
-
-	if err, ok := result.(error); ok && err != nil {
-		log.Error().Err(err).Msg("http_server: sendStopStatus ReconcilePort failed")
-		return err
-	}
-
-	log.Info().Msg("http_server: sendStopStatus completed successfully")
-	return nil
-}
-
-// sendStatus changes node and sends status if it's port enabled
-func (h *Component) sendStatus(ctx context.Context, _ StartContext, handler module.Handler) any {
-	// Update local metadataPort so getControl() returns correct status immediately
-	h.setMetadataPort(h.getListenPort())
-
-	_ = handler(ctx, v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
-
-		if n.Status.Metadata == nil {
-			n.Status.Metadata = map[string]string{}
-		}
-
-		n.Status.Metadata[PortMetadata] = fmt.Sprintf("%d", h.getListenPort())
-
-		// Store serialized startSettings so replicas can restore full config
-		if configData, err := json.Marshal(h.startSettings); err == nil {
-			n.Status.Metadata[ConfigMetadata] = string(configData)
-		}
-
-		return nil
-	})
-
-	if !h.settings.EnableStatusPort {
-		return nil
-	}
-	return handler(ctx, StatusPort, h.getStatus())
 }
 
 var _ module.Component = (*Component)(nil)
