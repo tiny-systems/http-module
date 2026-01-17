@@ -15,5 +15,7 @@ jobs:
       - run: |
           echo "Preparing a release"
           echo "Module name ${{ github.event.repository.name }}"
+          # Remove local replace directives (used for local dev only)
+          sed -i '/replace github.com\/tiny-systems\/module =>/d' go.mod
           go mod tidy
           go run cmd/main.go tools build --version ${{github.ref_name}} --name github.com/${{ github.repository }} --devkey ${{secrets.TINY_DEV_SECRET}}
