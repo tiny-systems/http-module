@@ -66,6 +66,10 @@ type Component struct {
 	state     State
 	hasState  bool // true when TinyState exists (server should be running)
 
+	// Notification channel for state changes (used by StartPort waiter)
+	stateChangeCh   chan struct{}
+	stateChangeLock *sync.Mutex
+
 	nodeName   string
 	sourceNode string // node that triggered Start (for ownership)
 	handler    module.Handler
@@ -83,6 +87,7 @@ func (h *Component) Instance() module.Component {
 		listenPortLock:       &sync.RWMutex{},
 		stateLock:            &sync.RWMutex{},
 		settingsLock:         &sync.Mutex{},
+		stateChangeLock:      &sync.Mutex{},
 		startSettings: Start{
 			WriteTimeout: 10,
 			ReadTimeout:  60,
@@ -376,6 +381,62 @@ func (h *Component) getState() (State, bool) {
 	return h.state, h.hasState
 }
 
+// notifyStateChange signals waiters that state has changed
+func (h *Component) notifyStateChange() {
+	h.stateChangeLock.Lock()
+	defer h.stateChangeLock.Unlock()
+	if h.stateChangeCh != nil {
+		close(h.stateChangeCh)
+		h.stateChangeCh = nil
+	}
+}
+
+// waitForStateDeleted blocks until hasState becomes false (state deleted)
+func (h *Component) waitForStateDeleted(ctx context.Context) {
+	for {
+		// Check if state is already deleted
+		_, hasState := h.getState()
+		if !hasState {
+			return
+		}
+
+		// Create notification channel
+		h.stateChangeLock.Lock()
+		if h.stateChangeCh == nil {
+			h.stateChangeCh = make(chan struct{})
+		}
+		ch := h.stateChangeCh
+		h.stateChangeLock.Unlock()
+
+		// Wait for state change or context cancellation
+		select {
+		case <-ch:
+			// State changed, loop to check if deleted
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// runServerFromState is called by leader when state arrives via StatePort
+// It starts the server and blocks until stopped, then deletes state
+func (h *Component) runServerFromState(parentCtx context.Context, handler module.Handler) {
+	log.Info().Msg("http_server: runServerFromState starting")
+
+	// Start the server (blocking)
+	err := h.start(parentCtx, handler)
+
+	log.Info().
+		Err(err).
+		Msg("http_server: runServerFromState server stopped, deleting state")
+
+	// Delete state when server stops
+	h.deleteState(handler)
+
+	// Trigger reconcile to update UI
+	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
+}
+
 func (h *Component) writeState(handler module.Handler, state State, ownerNode string) error {
 	stateData, err := json.Marshal(state)
 	if err != nil {
@@ -428,6 +489,9 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			h.hasState = false
 			h.stateLock.Unlock()
 
+			// Notify any waiters that state changed
+			h.notifyStateChange()
+
 			// Only leader stops the server
 			if moduleutils.IsLeader(ctx) {
 				_ = h.stop()
@@ -447,6 +511,7 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			Str("sourceNode", serverState.SourceNode).
 			Bool("isLeader", moduleutils.IsLeader(ctx)).
 			Int("localPort", h.getListenPort()).
+			Bool("isRunning", h.isRunning()).
 			Msg("http_server: received state, server should run")
 
 		// Update local state for UI display
@@ -459,10 +524,11 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		h.startSettings = serverState.Config
 		h.sourceNode = serverState.SourceNode
 
-		// Note: We do NOT start the server here.
-		// Server is started by blocking StartPort call from Signal.
-		// _state only updates local state and stops server on nil.
-		// On recovery, Signal will re-call StartPort which starts the server.
+		// Leader starts the server if not already running
+		if moduleutils.IsLeader(ctx) && !h.isRunning() {
+			log.Info().Msg("http_server: leader starting server from StatePort")
+			go h.runServerFromState(context.Background(), handler)
+		}
 
 		return nil
 
@@ -486,21 +552,19 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			return fmt.Errorf("invalid start message")
 		}
 
-		// Only leader processes start commands
-		if !moduleutils.IsLeader(ctx) {
-			return nil
-		}
-
 		// Get source node from context for ownership
 		sourceNode := moduleutils.GetSourceNode(ctx)
 		h.sourceNode = sourceNode
 		h.startSettings = in
 
+		isLeader := moduleutils.IsLeader(ctx)
+
 		log.Info().
 			Str("sourceNode", sourceNode).
-			Msg("http_server: StartPort received, writing state for crash recovery")
+			Bool("isLeader", isLeader).
+			Msg("http_server: StartPort received, writing state")
 
-		// Write state with owner - for crash recovery and cascade delete
+		// Any pod can write state - this triggers leader to start server via StatePort
 		if err := h.writeState(handler, State{
 			Config:     in,
 			SourceNode: sourceNode,
@@ -512,31 +576,21 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		// Trigger reconcile to update UI
 		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 
-		// BLOCK while server runs - this is the blocking API
-		log.Info().Msg("http_server: StartPort blocking while server runs")
-		err := h.start(ctx, handler)
+		// BLOCK until state is deleted (server stopped)
+		// This works for both leader and non-leader pods
+		log.Info().Msg("http_server: StartPort waiting for state deletion (server stop)")
+		h.waitForStateDeleted(ctx)
 
-		// If we reach here, server stopped (ctx cancelled, error, or natural stop)
-		// Delete state - crash recovery not needed for clean exit
-		log.Info().
-			Err(err).
-			Msg("http_server: StartPort unblocked, deleting state")
-		h.deleteState(handler)
-
-		// Trigger reconcile to update UI
-		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
-
-		return err
+		log.Info().Msg("http_server: StartPort state deleted, returning")
+		return nil
 
 	case StopPort:
-		// Only leader processes stop commands
-		if !moduleutils.IsLeader(ctx) {
-			return nil
-		}
+		isLeader := moduleutils.IsLeader(ctx)
+		log.Info().
+			Bool("isLeader", isLeader).
+			Msg("http_server: StopPort received, deleting state")
 
-		log.Info().Msg("http_server: StopPort received, deleting state")
-
-		// Delete state - this will trigger _state port with nil which stops the server
+		// Any pod can delete state - this triggers leader to stop server via StatePort
 		if err := h.deleteState(handler); err != nil {
 			log.Error().Err(err).Msg("http_server: failed to delete state")
 			return err
