@@ -443,6 +443,16 @@ func (h *Component) writeState(handler module.Handler, state State, ownerNode st
 		return err
 	}
 
+	// Update local state immediately (optimistic update)
+	// This ensures UI shows correct status before K8s round-trip completes
+	h.stateLock.Lock()
+	h.state = state
+	h.hasState = true
+	h.stateLock.Unlock()
+
+	// Notify waiters that state changed
+	h.notifyStateChange()
+
 	result := handler(context.Background(), v1alpha1.ReconcilePort, v1alpha1.StateUpdate{
 		Data:      stateData,
 		OwnerNode: ownerNode,
@@ -453,6 +463,16 @@ func (h *Component) writeState(handler module.Handler, state State, ownerNode st
 
 // deleteState deletes the TinyState CRD (nil Data signals deletion)
 func (h *Component) deleteState(handler module.Handler) error {
+	// Update local state immediately (optimistic update)
+	// This ensures UI shows correct status before K8s round-trip completes
+	h.stateLock.Lock()
+	h.state = State{}
+	h.hasState = false
+	h.stateLock.Unlock()
+
+	// Notify waiters that state changed
+	h.notifyStateChange()
+
 	result := handler(context.Background(), v1alpha1.ReconcilePort, v1alpha1.StateUpdate{
 		Data: nil,
 	})
