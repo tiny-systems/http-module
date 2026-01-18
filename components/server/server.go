@@ -498,9 +498,7 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 		// nil data means state was deleted - stop server
 		if data == nil {
-			log.Info().
-				Bool("isLeader", moduleutils.IsLeader(ctx)).
-				Msg("http_server: state deleted, stopping")
+			log.Info().Msg("http_server: state deleted, stopping")
 
 			// Reset local state
 			h.stateLock.Lock()
@@ -511,10 +509,8 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			// Notify any waiters that state changed
 			h.notifyStateChange()
 
-			// Only leader stops the server
-			if moduleutils.IsLeader(ctx) {
-				_ = h.stop()
-			}
+			// All pods stop their server
+			_ = h.stop()
 			return nil
 		}
 
@@ -543,9 +539,9 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		h.startSettings = serverState.Config
 		h.sourceNode = serverState.SourceNode
 
-		// Leader starts the server if not already running
-		if moduleutils.IsLeader(ctx) && !h.isRunning() {
-			log.Info().Msg("http_server: leader starting server from StatePort")
+		// All pods start the server for load balancing
+		if !h.isRunning() {
+			log.Info().Msg("http_server: starting server from StatePort")
 			go h.runServerFromState(context.Background(), handler)
 		}
 
