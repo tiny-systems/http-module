@@ -414,17 +414,19 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 				return nil
 			}
 			// Try to unmarshal as Start struct first
-			if err := json.Unmarshal(v, &in); err != nil {
-				// If that fails, the data is likely raw context from Signal
-				// Wrap it in Start.Context and use existing settings for other fields
+			if err := json.Unmarshal(v, &in); err == nil && (in.ReadTimeout > 0 || in.WriteTimeout > 0 || in.Context != nil) {
+				// Successfully parsed as Start struct with meaningful values
+				log.Info().Interface("start", in).Msg("http_server: parsed as Start struct")
+			} else {
+				// Data is raw context from Signal - wrap it in Start.Context
 				log.Info().Msg("http_server: received raw context, wrapping in Start struct")
 				in = h.startSettings
 				var ctx StartContext
 				if err := json.Unmarshal(v, &ctx); err == nil {
 					in.Context = ctx
 				}
+				log.Info().Interface("start", in).Msg("http_server: wrapped context in Start")
 			}
-			log.Info().Interface("start", in).Msg("http_server: parsed Start from []byte")
 		default:
 			return fmt.Errorf("invalid start message: expected Start or []byte, got %T", msg)
 		}
