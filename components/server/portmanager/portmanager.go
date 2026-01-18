@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
+	"github.com/rs/zerolog/log"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	v1core "k8s.io/api/core/v1"
 	v1ingress "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -230,70 +233,106 @@ func (m *Manager) addRulesIngress(ctx context.Context, ingress *v1ingress.Ingres
 	if len(hostnames) == 0 {
 		return []string{}, fmt.Errorf("no hostnames provided")
 	}
-	pathType := v1ingress.PathTypePrefix
 
-	rule := v1ingress.IngressRuleValue{
-		HTTP: &v1ingress.HTTPIngressRuleValue{
-			Paths: []v1ingress.HTTPIngressPath{
-				{
-					Path:     "/",
-					PathType: &pathType,
-					Backend: v1ingress.IngressBackend{
-						Service: &v1ingress.IngressServiceBackend{
-							Name: service.Name,
-							Port: v1ingress.ServiceBackendPort{
-								Number: int32(port),
+	// Retry loop for conflict errors
+	maxRetries := 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Re-fetch ingress on retry to get latest version
+			time.Sleep(time.Millisecond * 100 * time.Duration(attempt))
+			freshIngress, err := m.getReleaseIngressByName(ctx, ingress.Name)
+			if err != nil {
+				log.Error().Err(err).Msg("portmanager: failed to re-fetch ingress")
+				return []string{}, err
+			}
+			ingress = freshIngress
+		}
+
+		pathType := v1ingress.PathTypePrefix
+		rule := v1ingress.IngressRuleValue{
+			HTTP: &v1ingress.HTTPIngressRuleValue{
+				Paths: []v1ingress.HTTPIngressPath{
+					{
+						Path:     "/",
+						PathType: &pathType,
+						Backend: v1ingress.IngressBackend{
+							Service: &v1ingress.IngressServiceBackend{
+								Name: service.Name,
+								Port: v1ingress.ServiceBackendPort{
+									Number: int32(port),
+								},
 							},
 						},
 					},
 				},
 			},
-		},
-	}
-
-INGRESS:
-	for _, hostname := range hostnames {
-		for idx, r := range ingress.Spec.Rules {
-			if r.Host != hostname {
-				continue
-			}
-			ingress.Spec.Rules[idx].IngressRuleValue = rule
-			continue INGRESS
 		}
-		ingress.Spec.Rules = append(ingress.Spec.Rules, v1ingress.IngressRule{
-			Host:             hostname,
-			IngressRuleValue: rule,
-		})
-	}
 
-	var newHostNames []string
-
-HOSTNAMES:
-	for _, hostname := range hostnames {
-		for _, t := range ingress.Spec.TLS {
-			for _, th := range t.Hosts {
-				if th != hostname {
+	INGRESS:
+		for _, hostname := range hostnames {
+			for idx, r := range ingress.Spec.Rules {
+				if r.Host != hostname {
 					continue
 				}
-				continue HOSTNAMES
+				ingress.Spec.Rules[idx].IngressRuleValue = rule
+				continue INGRESS
 			}
-		}
-		newHostNames = append(newHostNames, hostname)
-	}
-
-	if len(newHostNames) > 0 {
-		for _, hostname := range newHostNames {
-			ingress.Spec.TLS = append(ingress.Spec.TLS, v1ingress.IngressTLS{
-				Hosts:      []string{hostname},
-				SecretName: fmt.Sprintf("%s-tls", hostname),
+			ingress.Spec.Rules = append(ingress.Spec.Rules, v1ingress.IngressRule{
+				Host:             hostname,
+				IngressRuleValue: rule,
 			})
 		}
-	}
 
-	if err := m.client.Update(ctx, ingress); err != nil {
+		var newHostNames []string
+
+	HOSTNAMES:
+		for _, hostname := range hostnames {
+			for _, t := range ingress.Spec.TLS {
+				for _, th := range t.Hosts {
+					if th != hostname {
+						continue
+					}
+					continue HOSTNAMES
+				}
+			}
+			newHostNames = append(newHostNames, hostname)
+		}
+
+		if len(newHostNames) > 0 {
+			for _, hostname := range newHostNames {
+				ingress.Spec.TLS = append(ingress.Spec.TLS, v1ingress.IngressTLS{
+					Hosts:      []string{hostname},
+					SecretName: fmt.Sprintf("%s-tls", hostname),
+				})
+			}
+		}
+
+		err := m.client.Update(ctx, ingress)
+		if err == nil {
+			return hostnames, nil
+		}
+
+		if errors.IsConflict(err) {
+			log.Warn().Int("attempt", attempt+1).Msg("portmanager: ingress update conflict, retrying")
+			continue
+		}
+
 		return []string{}, err
 	}
-	return hostnames, nil
+
+	return []string{}, fmt.Errorf("failed to update ingress after %d retries", maxRetries)
+}
+
+func (m *Manager) getReleaseIngressByName(ctx context.Context, name string) (*v1ingress.Ingress, error) {
+	ingress := &v1ingress.Ingress{}
+	err := m.client.Get(ctx, client.ObjectKey{
+		Namespace: m.namespace,
+		Name:      name,
+	}, ingress)
+	if err != nil {
+		return nil, err
+	}
+	return ingress, nil
 }
 
 func (m *Manager) removeRulesIngress(ctx context.Context, ingress *v1ingress.Ingress, service *v1core.Service, port int) error {
