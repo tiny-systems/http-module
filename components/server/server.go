@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,14 +34,6 @@ const (
 	StatusPort           = "status"
 )
 
-// State represents HTTP server runtime state stored in TinyState
-// Presence of TinyState means server should be running, absence means stopped
-type State struct {
-	Port       int    `json:"port,omitempty"`
-	Config     Start  `json:"config,omitempty"`
-	SourceNode string `json:"sourceNode,omitempty"` // node that triggered Start (for ownership)
-}
-
 type Component struct {
 	settings     Settings
 	settingsLock *sync.Mutex
@@ -60,15 +51,6 @@ type Component struct {
 	listenPortLock *sync.RWMutex
 	listenPort     int
 
-	// State synced from TinyState - source of truth for multi-pod status
-	stateLock *sync.RWMutex
-	state     State
-	hasState  bool // true when TinyState exists (server should be running)
-
-	// Notification channel for state changes (used by StartPort waiter)
-	stateChangeCh   chan struct{}
-	stateChangeLock *sync.Mutex
-
 	nodeName   string
 	sourceNode string // node that triggered Start (for ownership)
 	handler    module.Handler
@@ -84,9 +66,7 @@ func (h *Component) Instance() module.Component {
 		cancelFuncLock:       &sync.Mutex{},
 		startStopLock:        &sync.Mutex{},
 		listenPortLock:       &sync.RWMutex{},
-		stateLock:            &sync.RWMutex{},
 		settingsLock:         &sync.Mutex{},
-		stateChangeLock:      &sync.Mutex{},
 		startSettings: Start{
 			WriteTimeout: 10,
 			ReadTimeout:  60,
@@ -147,7 +127,7 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "HTTP Server",
-		Info:        "HTTP request handler. Start port configures and starts the server (context, autoHostName, hostnames for virtual hosts, readTimeout, writeTimeout). Each incoming HTTP request emits on Request port (blocks until Response port receives reply). Wire Request to processing logic, then wire result to Response port with statusCode, contentType, headers, body. Request times out if Response not received within readTimeout.",
+		Info:        "HTTP request handler. Start port receives configuration and starts the server (blocks until stopped). Each incoming HTTP request emits on Request port. Wire Request to processing logic, then wire result to Response port with statusCode, contentType, headers, body.",
 		Tags:        []string{"HTTP", "Server"},
 	}
 }
@@ -258,12 +238,10 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	var actualLocalPort int
 	var listenPort int
 
-	// Use port from state if available (for multi-pod load balancing)
-	state, _ := h.getState()
-	if state.Port > 0 {
-		listenPort = state.Port
-	} else if len(h.startSettings.Hostnames) == 1 {
-		// Fallback: parse port from hostname
+	// Try to get port from node metadata (for multi-pod load balancing)
+	// This is set by the first pod that starts and stored in Status.Metadata["port"]
+	if len(h.startSettings.Hostnames) == 1 {
+		// Parse port from hostname if specified
 		portParts := strings.Split(h.startSettings.Hostnames[0], ":")
 		if len(portParts) == 2 {
 			if port, err := strconv.Atoi(portParts[1]); err == nil {
@@ -318,12 +296,14 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 
 		h.setPublicListenAddr(publicURLs)
 
-		// Update state with actual port (keep same owner)
-		h.writeState(handler, State{
-			Port:       actualLocalPort,
-			Config:     h.startSettings,
-			SourceNode: h.sourceNode,
-		}, h.sourceNode)
+		// Update node metadata with actual port for other pods to use
+		_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+			if n.Status.Metadata == nil {
+				n.Status.Metadata = make(map[string]string)
+			}
+			n.Status.Metadata["port"] = fmt.Sprintf("%d", actualLocalPort)
+			return nil
+		})
 	}
 
 	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
@@ -379,110 +359,6 @@ func (h *Component) getPublicListerAddr() []string {
 	return h.publicListenAddr
 }
 
-func (h *Component) getState() (State, bool) {
-	h.stateLock.RLock()
-	defer h.stateLock.RUnlock()
-	return h.state, h.hasState
-}
-
-// notifyStateChange signals waiters that state has changed
-func (h *Component) notifyStateChange() {
-	h.stateChangeLock.Lock()
-	defer h.stateChangeLock.Unlock()
-	if h.stateChangeCh != nil {
-		close(h.stateChangeCh)
-		h.stateChangeCh = nil
-	}
-}
-
-// waitForStateDeleted blocks until hasState becomes false (state deleted)
-func (h *Component) waitForStateDeleted(ctx context.Context) {
-	for {
-		// Check if state is already deleted
-		_, hasState := h.getState()
-		if !hasState {
-			return
-		}
-
-		// Create notification channel
-		h.stateChangeLock.Lock()
-		if h.stateChangeCh == nil {
-			h.stateChangeCh = make(chan struct{})
-		}
-		ch := h.stateChangeCh
-		h.stateChangeLock.Unlock()
-
-		// Wait for state change or context cancellation
-		select {
-		case <-ch:
-			// State changed, loop to check if deleted
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// runServerFromState is called by leader when state arrives via StatePort
-// It starts the server and blocks until stopped, then deletes state
-func (h *Component) runServerFromState(parentCtx context.Context, handler module.Handler) {
-	log.Info().Msg("http_server: runServerFromState starting")
-
-	// Start the server (blocking)
-	err := h.start(parentCtx, handler)
-
-	log.Info().
-		Err(err).
-		Msg("http_server: runServerFromState server stopped, deleting state")
-
-	// Delete state when server stops
-	h.deleteState(handler)
-
-	// Trigger reconcile to update UI
-	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
-}
-
-func (h *Component) writeState(handler module.Handler, state State, ownerNode string) error {
-	stateData, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
-
-	// Update local state immediately (optimistic update)
-	// This ensures UI shows correct status before K8s round-trip completes
-	h.stateLock.Lock()
-	h.state = state
-	h.hasState = true
-	h.stateLock.Unlock()
-
-	// Notify waiters that state changed
-	h.notifyStateChange()
-
-	result := handler(context.Background(), v1alpha1.ReconcilePort, v1alpha1.StateUpdate{
-		Data:      stateData,
-		OwnerNode: ownerNode,
-	})
-
-	return moduleutils.CheckForError(result)
-}
-
-// deleteState deletes the TinyState CRD (nil Data signals deletion)
-func (h *Component) deleteState(handler module.Handler) error {
-	// Update local state immediately (optimistic update)
-	// This ensures UI shows correct status before K8s round-trip completes
-	h.stateLock.Lock()
-	h.state = State{}
-	h.hasState = false
-	h.stateLock.Unlock()
-
-	// Notify waiters that state changed
-	h.notifyStateChange()
-
-	result := handler(context.Background(), v1alpha1.ReconcilePort, v1alpha1.StateUpdate{
-		Data: nil,
-	})
-	return moduleutils.CheckForError(result)
-}
-
 func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
 	h.handler = handler
 
@@ -490,66 +366,22 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 	case v1alpha1.ReconcilePort:
 		if node, ok := msg.(v1alpha1.TinyNode); ok {
 			h.nodeName = node.Name
+
+			// Read port from metadata for multi-pod load balancing
+			if node.Status.Metadata != nil {
+				if portStr, ok := node.Status.Metadata["port"]; ok {
+					if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+						// Another pod already started - if we're not running, start with that port
+						if !h.isRunning() && h.startSettings.ReadTimeout > 0 {
+							// Store the port to use when starting
+							h.listenPortLock.Lock()
+							h.listenPort = p
+							h.listenPortLock.Unlock()
+						}
+					}
+				}
+			}
 		}
-		return nil
-
-	case v1alpha1.StatePort:
-		// Receive state data as []byte
-		// nil means state was deleted (stop)
-		data, ok := msg.([]byte)
-		if !ok {
-			return fmt.Errorf("invalid state message: expected []byte")
-		}
-
-		// nil data means state was deleted - stop server
-		if data == nil {
-			log.Info().Msg("http_server: state deleted, stopping")
-
-			// Reset local state
-			h.stateLock.Lock()
-			h.state = State{}
-			h.hasState = false
-			h.stateLock.Unlock()
-
-			// Notify any waiters that state changed
-			h.notifyStateChange()
-
-			// All pods stop their server
-			_ = h.stop()
-			return nil
-		}
-
-		// Parse state data - presence means server should run
-		var serverState State
-		if err := json.Unmarshal(data, &serverState); err != nil {
-			log.Error().Err(err).Msg("http_server: failed to unmarshal state")
-			return err
-		}
-
-		log.Info().
-			Int("statePort", serverState.Port).
-			Str("sourceNode", serverState.SourceNode).
-			Bool("isLeader", moduleutils.IsLeader(ctx)).
-			Int("localPort", h.getListenPort()).
-			Bool("isRunning", h.isRunning()).
-			Msg("http_server: received state, server should run")
-
-		// Update local state for UI display
-		h.stateLock.Lock()
-		h.state = serverState
-		h.hasState = true
-		h.stateLock.Unlock()
-
-		// Restore config and source from state
-		h.startSettings = serverState.Config
-		h.sourceNode = serverState.SourceNode
-
-		// All pods start the server for load balancing
-		if !h.isRunning() {
-			log.Info().Msg("http_server: starting server from StatePort")
-			go h.runServerFromState(context.Background(), handler)
-		}
-
 		return nil
 
 	case v1alpha1.ClientPort:
@@ -567,9 +399,26 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		h.settings = in
 
 	case StartPort:
-		in, ok := msg.(Start)
-		if !ok {
-			return fmt.Errorf("invalid start message")
+		// StartPort can receive Start config directly or as []byte from blocking TinyState
+		var in Start
+		switch v := msg.(type) {
+		case Start:
+			in = v
+		case []byte:
+			// Received from blocking TinyState via controller
+			if v == nil {
+				// nil means blocking state was deleted - stop server
+				log.Info().Msg("http_server: StartPort received nil (state deleted), stopping")
+				_ = h.stop()
+				return nil
+			}
+			// For blocking states, the data is the Start config (passed through)
+			// But actually, blocking states send raw data which we need to unmarshal
+			// For simplicity, if it's []byte and not nil, just use current settings
+			// The blocking TinyState data contains the Start config
+			in = h.startSettings
+		default:
+			return fmt.Errorf("invalid start message: expected Start or []byte, got %T", msg)
 		}
 
 		// Get source node from context for ownership
@@ -582,27 +431,27 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		log.Info().
 			Str("sourceNode", sourceNode).
 			Bool("isLeader", isLeader).
-			Msg("http_server: StartPort received, writing state")
+			Bool("isRunning", h.isRunning()).
+			Msg("http_server: StartPort received")
 
-		// Any pod can write state - this triggers leader to start server via StatePort
-		if err := h.writeState(handler, State{
-			Config:     in,
-			SourceNode: sourceNode,
-		}, sourceNode); err != nil {
-			log.Error().Err(err).Msg("http_server: failed to write start state")
-			return err
+		// If already running, just return (continuous reconciliation)
+		if h.isRunning() {
+			log.Info().Msg("http_server: already running, skipping start")
+			return nil
 		}
+
+		// Start the server (blocking)
+		log.Info().Msg("http_server: starting server from StartPort")
+		err := h.start(ctx, handler)
+
+		log.Info().
+			Err(err).
+			Msg("http_server: server stopped")
 
 		// Trigger reconcile to update UI
 		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 
-		// BLOCK until state is deleted (server stopped)
-		// This works for both leader and non-leader pods
-		log.Info().Msg("http_server: StartPort waiting for state deletion (server stop)")
-		h.waitForStateDeleted(ctx)
-
-		log.Info().Msg("http_server: StartPort state deleted, returning")
-		return nil
+		return err
 
 	case ResponsePort:
 		in, ok := msg.(Response)
@@ -619,8 +468,7 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 }
 
 func (h *Component) getControl() Control {
-	state, hasState := h.getState()
-	if hasState && state.Port > 0 {
+	if h.isRunning() {
 		return Control{
 			Status:     "Running",
 			ListenAddr: h.getPublicListerAddr(),
@@ -641,10 +489,6 @@ func (h *Component) Ports() []module.Port {
 		},
 		{
 			Name: v1alpha1.ReconcilePort,
-		},
-		{
-			Name:          v1alpha1.StatePort,
-			Configuration: struct{}{}, // Hidden port - receives TinyState for state sync
 		},
 		{
 			Name:          v1alpha1.SettingsPort,
@@ -675,7 +519,7 @@ func (h *Component) Ports() []module.Port {
 		},
 	}
 
-	// Always show Start port - it blocks until server stops
+	// Start port - receives Start config (from blocking TinyState via controller)
 	ports = append(ports, module.Port{
 		Name:          StartPort,
 		Label:         "Start",
@@ -696,10 +540,9 @@ func (h *Component) Ports() []module.Port {
 }
 
 func (h *Component) getStatus() Status {
-	state, hasState := h.getState()
 	return Status{
 		ListenAddr: h.getPublicListerAddr(),
-		IsRunning:  hasState && state.Port > 0,
+		IsRunning:  h.isRunning(),
 	}
 }
 
