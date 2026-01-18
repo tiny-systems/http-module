@@ -32,7 +32,6 @@ const (
 	ResponsePort         = "response"
 	RequestPort          = "request"
 	StartPort            = "start"
-	StopPort             = "stop"
 	StatusPort           = "status"
 )
 
@@ -604,23 +603,6 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		log.Info().Msg("http_server: StartPort state deleted, returning")
 		return nil
 
-	case StopPort:
-		isLeader := moduleutils.IsLeader(ctx)
-		log.Info().
-			Bool("isLeader", isLeader).
-			Msg("http_server: StopPort received, deleting state")
-
-		// Any pod can delete state - this triggers leader to stop server via StatePort
-		if err := h.deleteState(handler); err != nil {
-			log.Error().Err(err).Msg("http_server: failed to delete state")
-			return err
-		}
-
-		// Trigger reconcile to update UI
-		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
-
-		return nil // Don't block - state deletion will stop server
-
 	case ResponsePort:
 		in, ok := msg.(Response)
 		if !ok {
@@ -651,8 +633,6 @@ func (h *Component) getControl() Control {
 func (h *Component) Ports() []module.Port {
 	h.settingsLock.Lock()
 	defer h.settingsLock.Unlock()
-
-	_, hasState := h.getState()
 
 	ports := []module.Port{
 		{
@@ -694,22 +674,13 @@ func (h *Component) Ports() []module.Port {
 		},
 	}
 
-	// Show Start when not running, Stop when running
-	if hasState {
-		ports = append(ports, module.Port{
-			Name:          StopPort,
-			Label:         "Stop",
-			Position:      module.Left,
-			Configuration: struct{}{}, // Empty config - StopPort doesn't need input
-		})
-	} else {
-		ports = append(ports, module.Port{
-			Name:          StartPort,
-			Label:         "Start",
-			Position:      module.Left,
-			Configuration: h.startSettings,
-		})
-	}
+	// Always show Start port - it blocks until server stops
+	ports = append(ports, module.Port{
+		Name:          StartPort,
+		Label:         "Start",
+		Position:      module.Left,
+		Configuration: h.startSettings,
+	})
 
 	if h.settings.EnableStatusPort {
 		ports = append(ports, module.Port{
