@@ -588,8 +588,8 @@ func (h *Component) Ports() []module.Port {
 			Name: v1alpha1.ReconcilePort,
 		},
 		{
-			Name: v1alpha1.StatePort,
-			// Hidden port - receives TinyState for state sync
+			Name:          v1alpha1.StatePort,
+			Configuration: struct{}{}, // Hidden port - receives TinyState for state sync
 		},
 		{
 			Name:          v1alpha1.SettingsPort,
