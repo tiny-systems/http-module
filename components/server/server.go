@@ -697,9 +697,10 @@ func (h *Component) Ports() []module.Port {
 	// Show Start when not running, Stop when running
 	if hasState {
 		ports = append(ports, module.Port{
-			Name:     StopPort,
-			Label:    "Stop",
-			Position: module.Left,
+			Name:          StopPort,
+			Label:         "Stop",
+			Position:      module.Left,
+			Configuration: struct{}{}, // Empty config - StopPort doesn't need input
 		})
 	} else {
 		ports = append(ports, module.Port{
