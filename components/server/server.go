@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/goccy/go-json"
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog/log"
 	"github.com/tiny-systems/http-module/components/etc"
@@ -412,11 +413,18 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 				_ = h.stop()
 				return nil
 			}
-			// For blocking states, the data is the Start config (passed through)
-			// But actually, blocking states send raw data which we need to unmarshal
-			// For simplicity, if it's []byte and not nil, just use current settings
-			// The blocking TinyState data contains the Start config
-			in = h.startSettings
+			// Try to unmarshal as Start struct first
+			if err := json.Unmarshal(v, &in); err != nil {
+				// If that fails, the data is likely raw context from Signal
+				// Wrap it in Start.Context and use existing settings for other fields
+				log.Info().Msg("http_server: received raw context, wrapping in Start struct")
+				in = h.startSettings
+				var ctx StartContext
+				if err := json.Unmarshal(v, &ctx); err == nil {
+					in.Context = ctx
+				}
+			}
+			log.Info().Interface("start", in).Msg("http_server: parsed Start from []byte")
 		default:
 			return fmt.Errorf("invalid start message: expected Start or []byte, got %T", msg)
 		}
