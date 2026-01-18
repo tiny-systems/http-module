@@ -258,7 +258,12 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	var actualLocalPort int
 	var listenPort int
 
-	if len(h.startSettings.Hostnames) == 1 {
+	// Use port from state if available (for multi-pod load balancing)
+	state, _ := h.getState()
+	if state.Port > 0 {
+		listenPort = state.Port
+	} else if len(h.startSettings.Hostnames) == 1 {
+		// Fallback: parse port from hostname
 		portParts := strings.Split(h.startSettings.Hostnames[0], ":")
 		if len(portParts) == 2 {
 			if port, err := strconv.Atoi(portParts[1]); err == nil {
