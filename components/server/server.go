@@ -34,9 +34,8 @@ const (
 	StartPort            = "start"
 	StatusPort           = "status"
 
-	// Metadata keys for multi-pod state persistence
-	metadataKeyStart = "http-start" // Start config JSON for all pods to read
-	metadataKeyPort  = "port"       // Listen port for all pods to bind to
+	metadataKeyStart = "http-start"
+	metadataKeyPort  = "port"
 )
 
 type Component struct {
@@ -57,10 +56,9 @@ type Component struct {
 	listenPort     int
 
 	nodeName   string
-	sourceNode string // node that triggered Start (for ownership)
+	sourceNode string
 	handler    module.Handler
 
-	// port manager for exposing/disclosing ports via K8s Service/Ingress
 	portMgr *portmanager.Manager
 }
 
@@ -137,27 +135,105 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	}
 }
 
+// State management
+
 func (h *Component) stop() error {
 	h.cancelFuncLock.Lock()
 	defer h.cancelFuncLock.Unlock()
+
 	if h.cancelFunc == nil {
 		return nil
 	}
+
 	log.Info().Msg("stopping HTTP server")
 	h.cancelFunc()
 	return nil
 }
 
-func (h *Component) setCancelFunc(causeFunc context.CancelFunc) {
+func (h *Component) setCancelFunc(fn context.CancelFunc) {
 	h.cancelFuncLock.Lock()
 	defer h.cancelFuncLock.Unlock()
-	h.cancelFunc = causeFunc
+	h.cancelFunc = fn
 }
 
 func (h *Component) isRunning() bool {
 	h.cancelFuncLock.Lock()
 	defer h.cancelFuncLock.Unlock()
 	return h.cancelFunc != nil
+}
+
+func (h *Component) setPublicListenAddr(addr []string) {
+	h.publicListenAddrLock.Lock()
+	defer h.publicListenAddrLock.Unlock()
+	h.publicListenAddr = addr
+}
+
+func (h *Component) getPublicListenAddr() []string {
+	h.publicListenAddrLock.RLock()
+	defer h.publicListenAddrLock.RUnlock()
+	return h.publicListenAddr
+}
+
+func (h *Component) setListenPort(port int) {
+	h.listenPortLock.Lock()
+	defer h.listenPortLock.Unlock()
+	h.listenPort = port
+}
+
+func (h *Component) getListenPort() int {
+	h.listenPortLock.RLock()
+	defer h.listenPortLock.RUnlock()
+	return h.listenPort
+}
+
+// Handle dispatches to port-specific handlers
+
+func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
+	h.handler = handler
+
+	switch port {
+	case v1alpha1.ReconcilePort:
+		h.handleReconcile(msg, handler)
+		return nil
+	case v1alpha1.ClientPort:
+		return h.handleClient(msg)
+	case v1alpha1.SettingsPort:
+		return h.handleSettings(msg)
+	case StartPort:
+		return h.handleStart(ctx, handler, msg)
+	case ResponsePort:
+		return h.handleResponse(msg)
+	default:
+		return fmt.Errorf("port %s is not supported", port)
+	}
+}
+
+func (h *Component) handleClient(msg interface{}) error {
+	k8sProvider, ok := msg.(module.K8sClient)
+	if !ok {
+		return nil
+	}
+	h.portMgr = portmanager.New(k8sProvider.GetK8sClient(), k8sProvider.GetNamespace())
+	return nil
+}
+
+func (h *Component) handleSettings(msg interface{}) error {
+	in, ok := msg.(Settings)
+	if !ok {
+		return fmt.Errorf("invalid settings message")
+	}
+	h.settingsLock.Lock()
+	defer h.settingsLock.Unlock()
+	h.settings = in
+	return nil
+}
+
+func (h *Component) handleResponse(msg interface{}) any {
+	in, ok := msg.(Response)
+	if !ok {
+		return fmt.Errorf("invalid response message")
+	}
+	return in
 }
 
 func (h *Component) handleReconcile(msg interface{}, handler module.Handler) {
@@ -203,10 +279,7 @@ func (h *Component) readPortFromMetadata(metadata map[string]string) int {
 		return 0
 	}
 
-	h.listenPortLock.Lock()
-	h.listenPort = p
-	h.listenPortLock.Unlock()
-
+	h.setListenPort(p)
 	return p
 }
 
@@ -237,311 +310,302 @@ func (h *Component) startFromMetadata(handler module.Handler, port int) {
 	}
 
 	log.Info().Int("port", port).Msg("http_server: starting server from metadata")
-	if err := h.start(context.Background(), handler); err != nil {
+	if err := h.runServer(context.Background(), handler); err != nil {
 		log.Error().Err(err).Msg("http_server: server stopped after metadata restoration")
 	}
 }
 
-func (h *Component) start(ctx context.Context, handler module.Handler) error {
+func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg interface{}) error {
+	if msg == nil {
+		log.Info().Msg("http_server: StartPort received nil (state deleted), stopping")
+		_ = h.stop()
+		return nil
+	}
+
+	in := h.parseStartConfig(msg)
+
+	h.sourceNode = moduleutils.GetSourceNode(ctx)
+	h.startSettings = in
+
+	log.Info().
+		Str("sourceNode", h.sourceNode).
+		Bool("isLeader", moduleutils.IsLeader(ctx)).
+		Bool("isRunning", h.isRunning()).
+		Msg("http_server: StartPort received")
+
+	h.persistStartConfig(handler, in)
+
+	if h.isRunning() {
+		log.Info().Msg("http_server: already running, skipping start")
+		return nil
+	}
+
+	log.Info().Msg("http_server: starting server from StartPort")
+	err := h.runServer(ctx, handler)
+
+	log.Info().Err(err).Msg("http_server: server stopped")
+	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
+
+	return err
+}
+
+func (h *Component) parseStartConfig(msg interface{}) Start {
+	if start, ok := msg.(Start); ok {
+		return start
+	}
+
+	in := h.startSettings
+	in.Context = msg
+	return in
+}
+
+func (h *Component) persistStartConfig(handler module.Handler, cfg Start) {
+	startBytes, _ := json.Marshal(cfg)
+	_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+		if n.Status.Metadata == nil {
+			n.Status.Metadata = make(map[string]string)
+		}
+		n.Status.Metadata[metadataKeyStart] = string(startBytes)
+		return nil
+	})
+}
+
+// Server lifecycle
+
+func (h *Component) runServer(ctx context.Context, handler module.Handler) error {
 	if h.portMgr == nil {
 		return fmt.Errorf("unable to start, no port manager available")
 	}
 
-	log.Info().Msg("http-server start: entering")
+	log.Info().Msg("http-server: entering")
 
+	e := h.createEchoServer(handler)
+	serverCtx, serverCancel := context.WithCancel(ctx)
+	defer serverCancel()
+
+	h.setCancelFunc(serverCancel)
+	h.watchParentContext(ctx, serverCancel)
+
+	listenAddr := h.determineListenAddr()
+
+	go h.startEchoServer(e, listenAddr, serverCancel)
+
+	time.Sleep(time.Millisecond * 1500)
+
+	actualPort, err := h.handleServerStarted(ctx, e, handler)
+	if err != nil {
+		return err
+	}
+
+	log.Info().Msg("http-server: waiting on serverCtx.Done()")
+	<-serverCtx.Done()
+
+	h.shutdownServer(e, actualPort)
+	return serverCtx.Err()
+}
+
+func (h *Component) createEchoServer(handler module.Handler) *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = false
 
-	serverCtx, serverCancel := context.WithCancel(ctx)
-	defer serverCancel()
-
-	go func() {
-		<-ctx.Done()
-		log.Info().Msg("http-server start: parent context cancelled, stopping server")
-		serverCancel()
-	}()
-
-	h.setCancelFunc(serverCancel)
-
 	e.Any("*", func(c echo.Context) error {
-		requestResult := Request{
-			Context:       h.startSettings.Context,
-			Host:          c.Request().Host,
-			Method:        c.Request().Method,
-			RequestURI:    c.Request().RequestURI,
-			RequestParams: c.QueryParams(),
-			RealIP:        c.RealIP(),
-			Scheme:        c.Scheme(),
-			Headers:       make([]etc.Header, 0),
-			PodName:       os.Getenv("HOSTNAME"),
-		}
-		req := c.Request()
-
-		keys := make([]string, 0, len(req.Header))
-		for k := range req.Header {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			for _, v := range req.Header[k] {
-				requestResult.Headers = append(requestResult.Headers, etc.Header{
-					Key:   k,
-					Value: v,
-				})
-			}
-		}
-
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
-			return fmt.Errorf("read request body: %w", err)
-		}
-		requestResult.Body = utils.BytesToString(body)
-
-		resp := handler(c.Request().Context(), RequestPort, requestResult)
-		if err := moduleutils.CheckForError(resp); err != nil {
-			return err
-		}
-
-		respObj, ok := resp.(Response)
-		if !ok {
-			return fmt.Errorf("invalid response")
-		}
-
-		for _, header := range respObj.Headers {
-			c.Response().Header().Set(header.Key, header.Value)
-		}
-		if respObj.ContentType != "" {
-			c.Response().Header().Set(etc.HeaderContentType, string(respObj.ContentType))
-		}
-		_ = c.String(respObj.StatusCode, fmt.Sprintf("%v", respObj.Body))
-
-		return nil
+		return h.handleHTTPRequest(c, handler)
 	})
 
 	e.Server.ReadTimeout = time.Duration(h.startSettings.ReadTimeout) * time.Second
 	e.Server.WriteTimeout = time.Duration(h.startSettings.WriteTimeout) * time.Second
 
-	var actualLocalPort int
+	return e
+}
 
-	// Use port from metadata if set (for multi-pod load balancing)
-	listenPort := h.getListenPort()
+func (h *Component) handleHTTPRequest(c echo.Context, handler module.Handler) error {
+	req := h.buildRequest(c)
 
-	var listenAddr = ":0"
-	if listenPort > 0 {
-		log.Info().Int("port", listenPort).Msg("http_server: using port from metadata")
-		listenAddr = fmt.Sprintf(":%d", listenPort)
+	resp := handler(c.Request().Context(), RequestPort, req)
+	if err := moduleutils.CheckForError(resp); err != nil {
+		return err
 	}
 
-	go func() {
-		err := e.Start(listenAddr)
-		if err == nil || errors.Is(err, http.ErrServerClosed) {
-			return
+	respObj, ok := resp.(Response)
+	if !ok {
+		return fmt.Errorf("invalid response")
+	}
+
+	h.writeResponse(c, respObj)
+	return nil
+}
+
+func (h *Component) buildRequest(c echo.Context) Request {
+	req := Request{
+		Context:       h.startSettings.Context,
+		Host:          c.Request().Host,
+		Method:        c.Request().Method,
+		RequestURI:    c.Request().RequestURI,
+		RequestParams: c.QueryParams(),
+		RealIP:        c.RealIP(),
+		Scheme:        c.Scheme(),
+		Headers:       h.extractHeaders(c.Request()),
+		PodName:       os.Getenv("HOSTNAME"),
+	}
+
+	body, err := io.ReadAll(c.Request().Body)
+	if err == nil {
+		req.Body = utils.BytesToString(body)
+	}
+
+	return req
+}
+
+func (h *Component) extractHeaders(r *http.Request) []etc.Header {
+	headers := make([]etc.Header, 0)
+
+	keys := make([]string, 0, len(r.Header))
+	for k := range r.Header {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		for _, v := range r.Header[k] {
+			headers = append(headers, etc.Header{Key: k, Value: v})
 		}
-		log.Error().Err(err).Int("port", listenPort).Msg("failed to start HTTP server")
-		serverCancel()
+	}
+
+	return headers
+}
+
+func (h *Component) writeResponse(c echo.Context, resp Response) {
+	for _, header := range resp.Headers {
+		c.Response().Header().Set(header.Key, header.Value)
+	}
+
+	if resp.ContentType != "" {
+		c.Response().Header().Set(etc.HeaderContentType, string(resp.ContentType))
+	}
+
+	_ = c.String(resp.StatusCode, fmt.Sprintf("%v", resp.Body))
+}
+
+func (h *Component) watchParentContext(ctx context.Context, cancel context.CancelFunc) {
+	go func() {
+		<-ctx.Done()
+		log.Info().Msg("http-server: parent context cancelled, stopping server")
+		cancel()
 	}()
+}
 
-	time.Sleep(time.Millisecond * 1500)
+func (h *Component) determineListenAddr() string {
+	listenPort := h.getListenPort()
+	if listenPort > 0 {
+		log.Info().Int("port", listenPort).Msg("http_server: using port from metadata")
+		return fmt.Sprintf(":%d", listenPort)
+	}
+	return ":0"
+}
 
+func (h *Component) startEchoServer(e *echo.Echo, addr string, cancel context.CancelFunc) {
+	err := e.Start(addr)
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return
+	}
+	log.Error().Err(err).Str("addr", addr).Msg("failed to start HTTP server")
+	cancel()
+}
+
+func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handler module.Handler) (int, error) {
 	if e.Listener == nil {
 		log.Error().Msg("HTTP server failed to bind - listener is nil")
 		h.setListenPort(0)
-		return fmt.Errorf("server failed to bind")
+		return 0, fmt.Errorf("server failed to bind")
 	}
 
-	if tcpAddr, ok := e.Listener.Addr().(*net.TCPAddr); ok {
-		actualLocalPort = tcpAddr.Port
-		log.Info().Int("port", actualLocalPort).Msg("HTTP server started successfully")
-
-		time.Sleep(time.Second)
-		h.setListenPort(actualLocalPort)
-
-		exposeCtx, exposeCancel := context.WithTimeout(ctx, time.Second*30)
-		defer exposeCancel()
-
-		var autoHostName string
-		if h.startSettings.AutoHostName || len(h.startSettings.Hostnames) == 0 {
-			autoHostNameParts := strings.Split(h.nodeName, ".")
-			autoHostName = autoHostNameParts[len(autoHostNameParts)-1]
-		}
-
-		publicURLs, err := h.portMgr.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, tcpAddr.Port)
-		if err != nil {
-			log.Error().Err(err).Msg("failed to expose port")
-			publicURLs = []string{fmt.Sprintf("http://localhost:%d", tcpAddr.Port)}
-		}
-
-		h.setPublicListenAddr(publicURLs)
-
-		// Update node metadata with actual port for other pods to use
-		_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
-			if n.Status.Metadata == nil {
-				n.Status.Metadata = make(map[string]string)
-			}
-			n.Status.Metadata[metadataKeyPort] = fmt.Sprintf("%d", actualLocalPort)
-			return nil
-		})
+	tcpAddr, ok := e.Listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, nil
 	}
 
+	actualPort := tcpAddr.Port
+	log.Info().Int("port", actualPort).Msg("HTTP server started successfully")
+
+	time.Sleep(time.Second)
+	h.setListenPort(actualPort)
+
+	publicURLs := h.exposePort(ctx, tcpAddr.Port)
+	h.setPublicListenAddr(publicURLs)
+
+	h.persistPort(handler, actualPort)
 	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 
-	log.Info().Msg("http-server start: waiting on serverCtx.Done()")
+	return actualPort, nil
+}
 
-	<-serverCtx.Done()
+func (h *Component) exposePort(ctx context.Context, port int) []string {
+	exposeCtx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
 
-	log.Info().Msg("http-server start: serverCtx done, shutting down")
+	var autoHostName string
+	if h.startSettings.AutoHostName || len(h.startSettings.Hostnames) == 0 {
+		parts := strings.Split(h.nodeName, ".")
+		autoHostName = parts[len(parts)-1]
+	}
 
-	shutdownCtx, shutDownCancel := context.WithTimeout(context.Background(), time.Second*30)
-	defer shutDownCancel()
+	publicURLs, err := h.portMgr.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, port)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to expose port")
+		return []string{fmt.Sprintf("http://localhost:%d", port)}
+	}
+
+	return publicURLs
+}
+
+func (h *Component) persistPort(handler module.Handler, port int) {
+	_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+		if n.Status.Metadata == nil {
+			n.Status.Metadata = make(map[string]string)
+		}
+		n.Status.Metadata[metadataKeyPort] = fmt.Sprintf("%d", port)
+		return nil
+	})
+}
+
+func (h *Component) shutdownServer(e *echo.Echo, actualPort int) {
+	log.Info().Msg("http-server: serverCtx done, shutting down")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
 
 	_ = e.Shutdown(shutdownCtx)
 
 	h.setCancelFunc(nil)
 	h.setListenPort(0)
 
-	if actualLocalPort > 0 {
+	if actualPort > 0 {
 		discloseCtx, discloseCancel := context.WithTimeout(context.Background(), time.Second*30)
 		defer discloseCancel()
-		_ = h.portMgr.DisclosePort(discloseCtx, actualLocalPort)
+		_ = h.portMgr.DisclosePort(discloseCtx, actualPort)
 	}
 
 	h.setPublicListenAddr([]string{})
-
-	log.Info().Msg("http-server start: exiting")
-
-	return serverCtx.Err()
+	log.Info().Msg("http-server: exiting")
 }
 
-func (h *Component) setPublicListenAddr(addr []string) {
-	h.publicListenAddrLock.Lock()
-	defer h.publicListenAddrLock.Unlock()
-	h.publicListenAddr = addr
-}
-
-func (h *Component) setListenPort(port int) {
-	h.listenPortLock.Lock()
-	defer h.listenPortLock.Unlock()
-	h.listenPort = port
-}
-
-func (h *Component) getListenPort() int {
-	h.listenPortLock.RLock()
-	defer h.listenPortLock.RUnlock()
-	return h.listenPort
-}
-
-func (h *Component) getPublicListerAddr() []string {
-	h.publicListenAddrLock.RLock()
-	defer h.publicListenAddrLock.RUnlock()
-	return h.publicListenAddr
-}
-
-func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
-	h.handler = handler
-
-	switch port {
-	case v1alpha1.ReconcilePort:
-		h.handleReconcile(msg, handler)
-		return nil
-
-	case v1alpha1.ClientPort:
-		if k8sProvider, ok := msg.(module.K8sClient); ok {
-			h.portMgr = portmanager.New(k8sProvider.GetK8sClient(), k8sProvider.GetNamespace())
-		}
-
-	case v1alpha1.SettingsPort:
-		in, ok := msg.(Settings)
-		if !ok {
-			return fmt.Errorf("invalid settings message")
-		}
-		h.settingsLock.Lock()
-		defer h.settingsLock.Unlock()
-		h.settings = in
-
-	case StartPort:
-		// nil means blocking state was deleted - stop server
-		if msg == nil {
-			log.Info().Msg("http_server: StartPort received nil (state deleted), stopping")
-			_ = h.stop()
-			return nil
-		}
-
-		// Accept Start struct directly, or treat any other type as context
-		var in Start
-		if start, ok := msg.(Start); ok {
-			in = start
-		} else {
-			// Treat msg as context, use settings for other fields
-			in = h.startSettings
-			in.Context = msg
-		}
-
-		// Get source node from context for ownership
-		sourceNode := moduleutils.GetSourceNode(ctx)
-		h.sourceNode = sourceNode
-		h.startSettings = in
-
-		isLeader := moduleutils.IsLeader(ctx)
-
-		log.Info().
-			Str("sourceNode", sourceNode).
-			Bool("isLeader", isLeader).
-			Bool("isRunning", h.isRunning()).
-			Msg("http_server: StartPort received")
-
-		// Persist Start config to metadata so all pods can read it
-		startBytes, _ := json.Marshal(in)
-		_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
-			if n.Status.Metadata == nil {
-				n.Status.Metadata = make(map[string]string)
-			}
-			n.Status.Metadata[metadataKeyStart] = string(startBytes)
-			return nil
-		})
-
-		// If already running, just return (continuous reconciliation)
-		if h.isRunning() {
-			log.Info().Msg("http_server: already running, skipping start")
-			return nil
-		}
-
-		// Start the server (blocking)
-		log.Info().Msg("http_server: starting server from StartPort")
-		err := h.start(ctx, handler)
-
-		log.Info().
-			Err(err).
-			Msg("http_server: server stopped")
-
-		// Trigger reconcile to update UI
-		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
-
-		return err
-
-	case ResponsePort:
-		in, ok := msg.(Response)
-		if !ok {
-			return fmt.Errorf("invalid response message")
-		}
-		return in
-
-	default:
-		return fmt.Errorf("port %s is not supported", port)
-	}
-
-	return nil
-}
+// UI helpers
 
 func (h *Component) getControl() Control {
 	if h.isRunning() {
 		return Control{
 			Status:     "Running",
-			ListenAddr: h.getPublicListerAddr(),
+			ListenAddr: h.getPublicListenAddr(),
 		}
 	}
-	return Control{
-		Status: "Not running",
+	return Control{Status: "Not running"}
+}
+
+func (h *Component) getStatus() Status {
+	return Status{
+		ListenAddr: h.getPublicListenAddr(),
+		IsRunning:  h.isRunning(),
 	}
 }
 
@@ -550,12 +614,8 @@ func (h *Component) Ports() []module.Port {
 	defer h.settingsLock.Unlock()
 
 	ports := []module.Port{
-		{
-			Name: v1alpha1.ClientPort,
-		},
-		{
-			Name: v1alpha1.ReconcilePort,
-		},
+		{Name: v1alpha1.ClientPort},
+		{Name: v1alpha1.ReconcilePort},
 		{
 			Name:          v1alpha1.SettingsPort,
 			Label:         "Settings",
@@ -570,12 +630,10 @@ func (h *Component) Ports() []module.Port {
 			ResponseConfiguration: Response{},
 		},
 		{
-			Name:     ResponsePort,
-			Label:    "Response",
-			Position: module.Right,
-			Configuration: Response{
-				StatusCode: 200,
-			},
+			Name:          ResponsePort,
+			Label:         "Response",
+			Position:      module.Right,
+			Configuration: Response{StatusCode: 200},
 		},
 		{
 			Name:          v1alpha1.ControlPort,
@@ -583,15 +641,13 @@ func (h *Component) Ports() []module.Port {
 			Source:        true,
 			Configuration: h.getControl(),
 		},
+		{
+			Name:          StartPort,
+			Label:         "Start",
+			Position:      module.Left,
+			Configuration: h.startSettings,
+		},
 	}
-
-	// Start port - receives Start config (from blocking TinyState via controller)
-	ports = append(ports, module.Port{
-		Name:          StartPort,
-		Label:         "Start",
-		Position:      module.Left,
-		Configuration: h.startSettings,
-	})
 
 	if h.settings.EnableStatusPort {
 		ports = append(ports, module.Port{
@@ -602,14 +658,8 @@ func (h *Component) Ports() []module.Port {
 			Configuration: h.getStatus(),
 		})
 	}
-	return ports
-}
 
-func (h *Component) getStatus() Status {
-	return Status{
-		ListenAddr: h.getPublicListerAddr(),
-		IsRunning:  h.isRunning(),
-	}
+	return ports
 }
 
 var _ module.Component = (*Component)(nil)
