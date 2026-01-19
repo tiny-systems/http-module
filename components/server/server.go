@@ -241,22 +241,13 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	e.Server.WriteTimeout = time.Duration(h.startSettings.WriteTimeout) * time.Second
 
 	var actualLocalPort int
-	var listenPort int
 
-	// Try to get port from node metadata (for multi-pod load balancing)
-	// This is set by the first pod that starts and stored in Status.Metadata["port"]
-	if len(h.startSettings.Hostnames) == 1 {
-		// Parse port from hostname if specified
-		portParts := strings.Split(h.startSettings.Hostnames[0], ":")
-		if len(portParts) == 2 {
-			if port, err := strconv.Atoi(portParts[1]); err == nil {
-				listenPort = port
-			}
-		}
-	}
+	// Use port from metadata if set (for multi-pod load balancing)
+	listenPort := h.getListenPort()
 
 	var listenAddr = ":0"
 	if listenPort > 0 {
+		log.Info().Int("port", listenPort).Msg("http_server: using port from metadata")
 		listenAddr = fmt.Sprintf(":%d", listenPort)
 	}
 
