@@ -160,6 +160,88 @@ func (h *Component) isRunning() bool {
 	return h.cancelFunc != nil
 }
 
+func (h *Component) handleReconcile(msg interface{}, handler module.Handler) {
+	node, ok := msg.(v1alpha1.TinyNode)
+	if !ok {
+		return
+	}
+
+	h.nodeName = node.Name
+
+	if node.Status.Metadata == nil {
+		return
+	}
+
+	metadataPort := h.readPortFromMetadata(node.Status.Metadata)
+	if metadataPort == 0 {
+		return
+	}
+
+	if h.isRunning() {
+		return
+	}
+
+	startCfg, ok := h.readStartFromMetadata(node.Status.Metadata)
+	if !ok {
+		return
+	}
+
+	h.startSettings = startCfg
+	log.Info().Interface("start", startCfg).Int("port", metadataPort).Msg("http_server: restoring from metadata")
+
+	go h.startFromMetadata(handler, metadataPort)
+}
+
+func (h *Component) readPortFromMetadata(metadata map[string]string) int {
+	portStr, ok := metadata[metadataKeyPort]
+	if !ok {
+		return 0
+	}
+
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p <= 0 {
+		return 0
+	}
+
+	h.listenPortLock.Lock()
+	h.listenPort = p
+	h.listenPortLock.Unlock()
+
+	return p
+}
+
+func (h *Component) readStartFromMetadata(metadata map[string]string) (Start, bool) {
+	startStr, ok := metadata[metadataKeyStart]
+	if !ok || startStr == "" {
+		return Start{}, false
+	}
+
+	var cfg Start
+	if err := json.Unmarshal([]byte(startStr), &cfg); err != nil {
+		return Start{}, false
+	}
+
+	if cfg.ReadTimeout == 0 && cfg.WriteTimeout == 0 {
+		return Start{}, false
+	}
+
+	return cfg, true
+}
+
+func (h *Component) startFromMetadata(handler module.Handler, port int) {
+	h.startStopLock.Lock()
+	defer h.startStopLock.Unlock()
+
+	if h.isRunning() {
+		return
+	}
+
+	log.Info().Int("port", port).Msg("http_server: starting server from metadata")
+	if err := h.start(context.Background(), handler); err != nil {
+		log.Error().Err(err).Msg("http_server: server stopped after metadata restoration")
+	}
+}
+
 func (h *Component) start(ctx context.Context, handler module.Handler) error {
 	if h.portMgr == nil {
 		return fmt.Errorf("unable to start, no port manager available")
@@ -360,52 +442,7 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 	switch port {
 	case v1alpha1.ReconcilePort:
-		if node, ok := msg.(v1alpha1.TinyNode); ok {
-			h.nodeName = node.Name
-
-			// Read from metadata for multi-pod state restoration
-			if node.Status.Metadata != nil {
-				// Read port from metadata
-				var metadataPort int
-				if portStr, ok := node.Status.Metadata[metadataKeyPort]; ok {
-					if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
-						metadataPort = p
-						h.listenPortLock.Lock()
-						h.listenPort = p
-						h.listenPortLock.Unlock()
-					}
-				}
-
-				// If not running but Start config AND port exist in metadata, start the server
-				// Both must exist to avoid race condition - wait for first pod to write port
-				// This enables multi-pod load balancing - all pods use the same port
-				if !h.isRunning() && metadataPort > 0 {
-					if startStr, ok := node.Status.Metadata[metadataKeyStart]; ok && startStr != "" {
-						var startCfg Start
-						if err := json.Unmarshal([]byte(startStr), &startCfg); err == nil && (startCfg.ReadTimeout > 0 || startCfg.WriteTimeout > 0) {
-							log.Info().Interface("start", startCfg).Int("port", metadataPort).Msg("http_server: restoring from metadata")
-							h.startSettings = startCfg
-
-							// Start server in goroutine to not block reconcile
-							go func() {
-								h.startStopLock.Lock()
-								defer h.startStopLock.Unlock()
-
-								if h.isRunning() {
-									return
-								}
-
-								log.Info().Int("port", metadataPort).Msg("http_server: starting server from metadata restoration")
-								err := h.start(context.Background(), handler)
-								if err != nil {
-									log.Error().Err(err).Msg("http_server: server stopped after metadata restoration")
-								}
-							}()
-						}
-					}
-				}
-			}
-		}
+		h.handleReconcile(msg, handler)
 		return nil
 
 	case v1alpha1.ClientPort:
