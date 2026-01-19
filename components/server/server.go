@@ -423,44 +423,21 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		h.settings = in
 
 	case StartPort:
-		// StartPort can receive Start config directly or as []byte from blocking TinyState
-		var in Start
-		switch v := msg.(type) {
-		case nil:
-			// nil means blocking state was deleted - stop server and clear metadata
+		// nil means blocking state was deleted - stop server
+		if msg == nil {
 			log.Info().Msg("http_server: StartPort received nil (state deleted), stopping")
 			_ = h.stop()
-
-			// Clear start config from metadata so other pods don't restart
-			_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
-				if n.Status.Metadata != nil {
-					delete(n.Status.Metadata, metadataKeyStart)
-					delete(n.Status.Metadata, metadataKeyPort)
-				}
-				return nil
-			})
-
 			return nil
-		case Start:
-			in = v
-		case []byte:
-			// Received from blocking TinyState via controller
-			// Try to unmarshal as Start struct first
-			if err := json.Unmarshal(v, &in); err == nil && (in.ReadTimeout > 0 || in.WriteTimeout > 0 || in.Context != nil) {
-				// Successfully parsed as Start struct with meaningful values
-				log.Info().Interface("start", in).Msg("http_server: parsed as Start struct")
-			} else {
-				// Data is raw context from Signal - wrap it in Start.Context
-				log.Info().Msg("http_server: received raw context, wrapping in Start struct")
-				in = h.startSettings
-				var ctx StartContext
-				if err := json.Unmarshal(v, &ctx); err == nil {
-					in.Context = ctx
-				}
-				log.Info().Interface("start", in).Msg("http_server: wrapped context in Start")
-			}
-		default:
-			return fmt.Errorf("invalid start message: expected Start or []byte, got %T", msg)
+		}
+
+		// Accept Start struct directly, or treat any other type as context
+		var in Start
+		if start, ok := msg.(Start); ok {
+			in = start
+		} else {
+			// Treat msg as context, use settings for other fields
+			in = h.startSettings
+			in.Context = msg
 		}
 
 		// Get source node from context for ownership
