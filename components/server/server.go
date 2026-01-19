@@ -426,26 +426,25 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		// StartPort can receive Start config directly or as []byte from blocking TinyState
 		var in Start
 		switch v := msg.(type) {
+		case nil:
+			// nil means blocking state was deleted - stop server and clear metadata
+			log.Info().Msg("http_server: StartPort received nil (state deleted), stopping")
+			_ = h.stop()
+
+			// Clear start config from metadata so other pods don't restart
+			_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+				if n.Status.Metadata != nil {
+					delete(n.Status.Metadata, metadataKeyStart)
+					delete(n.Status.Metadata, metadataKeyPort)
+				}
+				return nil
+			})
+
+			return nil
 		case Start:
 			in = v
 		case []byte:
 			// Received from blocking TinyState via controller
-			if v == nil {
-				// nil means blocking state was deleted - stop server and clear metadata
-				log.Info().Msg("http_server: StartPort received nil (state deleted), stopping")
-				_ = h.stop()
-
-				// Clear start config from metadata so other pods don't restart
-				_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
-					if n.Status.Metadata != nil {
-						delete(n.Status.Metadata, metadataKeyStart)
-						delete(n.Status.Metadata, metadataKeyPort)
-					}
-					return nil
-				})
-
-				return nil
-			}
 			// Try to unmarshal as Start struct first
 			if err := json.Unmarshal(v, &in); err == nil && (in.ReadTimeout > 0 || in.WriteTimeout > 0 || in.Context != nil) {
 				// Successfully parsed as Start struct with meaningful values
