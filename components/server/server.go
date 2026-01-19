@@ -375,21 +375,24 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			// Read from metadata for multi-pod state restoration
 			if node.Status.Metadata != nil {
 				// Read port from metadata
+				var metadataPort int
 				if portStr, ok := node.Status.Metadata[metadataKeyPort]; ok {
 					if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+						metadataPort = p
 						h.listenPortLock.Lock()
 						h.listenPort = p
 						h.listenPortLock.Unlock()
 					}
 				}
 
-				// If not running but Start config exists in metadata, start the server
-				// This enables multi-pod load balancing - all pods read the same config
-				if !h.isRunning() {
+				// If not running but Start config AND port exist in metadata, start the server
+				// Both must exist to avoid race condition - wait for first pod to write port
+				// This enables multi-pod load balancing - all pods use the same port
+				if !h.isRunning() && metadataPort > 0 {
 					if startStr, ok := node.Status.Metadata[metadataKeyStart]; ok && startStr != "" {
 						var startCfg Start
 						if err := json.Unmarshal([]byte(startStr), &startCfg); err == nil && (startCfg.ReadTimeout > 0 || startCfg.WriteTimeout > 0) {
-							log.Info().Interface("start", startCfg).Msg("http_server: restoring from metadata")
+							log.Info().Interface("start", startCfg).Int("port", metadataPort).Msg("http_server: restoring from metadata")
 							h.startSettings = startCfg
 
 							// Start server in goroutine to not block reconcile
@@ -401,7 +404,7 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 									return
 								}
 
-								log.Info().Msg("http_server: starting server from metadata restoration")
+								log.Info().Int("port", metadataPort).Msg("http_server: starting server from metadata restoration")
 								err := h.start(context.Background(), handler)
 								if err != nil {
 									log.Error().Err(err).Msg("http_server: server stopped after metadata restoration")
