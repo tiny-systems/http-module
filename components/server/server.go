@@ -33,6 +33,10 @@ const (
 	RequestPort          = "request"
 	StartPort            = "start"
 	StatusPort           = "status"
+
+	// Metadata keys for multi-pod state persistence
+	metadataKeyStart = "http-start" // Start config JSON for all pods to read
+	metadataKeyPort  = "port"       // Listen port for all pods to bind to
 )
 
 type Component struct {
@@ -302,7 +306,7 @@ func (h *Component) start(ctx context.Context, handler module.Handler) error {
 			if n.Status.Metadata == nil {
 				n.Status.Metadata = make(map[string]string)
 			}
-			n.Status.Metadata["port"] = fmt.Sprintf("%d", actualLocalPort)
+			n.Status.Metadata[metadataKeyPort] = fmt.Sprintf("%d", actualLocalPort)
 			return nil
 		})
 	}
@@ -368,16 +372,41 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		if node, ok := msg.(v1alpha1.TinyNode); ok {
 			h.nodeName = node.Name
 
-			// Read port from metadata for multi-pod load balancing
+			// Read from metadata for multi-pod state restoration
 			if node.Status.Metadata != nil {
-				if portStr, ok := node.Status.Metadata["port"]; ok {
+				// Read port from metadata
+				if portStr, ok := node.Status.Metadata[metadataKeyPort]; ok {
 					if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
-						// Another pod already started - if we're not running, start with that port
-						if !h.isRunning() && h.startSettings.ReadTimeout > 0 {
-							// Store the port to use when starting
-							h.listenPortLock.Lock()
-							h.listenPort = p
-							h.listenPortLock.Unlock()
+						h.listenPortLock.Lock()
+						h.listenPort = p
+						h.listenPortLock.Unlock()
+					}
+				}
+
+				// If not running but Start config exists in metadata, start the server
+				// This enables multi-pod load balancing - all pods read the same config
+				if !h.isRunning() {
+					if startStr, ok := node.Status.Metadata[metadataKeyStart]; ok && startStr != "" {
+						var startCfg Start
+						if err := json.Unmarshal([]byte(startStr), &startCfg); err == nil && (startCfg.ReadTimeout > 0 || startCfg.WriteTimeout > 0) {
+							log.Info().Interface("start", startCfg).Msg("http_server: restoring from metadata")
+							h.startSettings = startCfg
+
+							// Start server in goroutine to not block reconcile
+							go func() {
+								h.startStopLock.Lock()
+								defer h.startStopLock.Unlock()
+
+								if h.isRunning() {
+									return
+								}
+
+								log.Info().Msg("http_server: starting server from metadata restoration")
+								err := h.start(context.Background(), handler)
+								if err != nil {
+									log.Error().Err(err).Msg("http_server: server stopped after metadata restoration")
+								}
+							}()
 						}
 					}
 				}
@@ -408,9 +437,19 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		case []byte:
 			// Received from blocking TinyState via controller
 			if v == nil {
-				// nil means blocking state was deleted - stop server
+				// nil means blocking state was deleted - stop server and clear metadata
 				log.Info().Msg("http_server: StartPort received nil (state deleted), stopping")
 				_ = h.stop()
+
+				// Clear start config from metadata so other pods don't restart
+				_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+					if n.Status.Metadata != nil {
+						delete(n.Status.Metadata, metadataKeyStart)
+						delete(n.Status.Metadata, metadataKeyPort)
+					}
+					return nil
+				})
+
 				return nil
 			}
 			// Try to unmarshal as Start struct first
@@ -443,6 +482,16 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			Bool("isLeader", isLeader).
 			Bool("isRunning", h.isRunning()).
 			Msg("http_server: StartPort received")
+
+		// Persist Start config to metadata so all pods can read it
+		startBytes, _ := json.Marshal(in)
+		_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+			if n.Status.Metadata == nil {
+				n.Status.Metadata = make(map[string]string)
+			}
+			n.Status.Metadata[metadataKeyStart] = string(startBytes)
+			return nil
+		})
 
 		// If already running, just return (continuous reconciliation)
 		if h.isRunning() {
