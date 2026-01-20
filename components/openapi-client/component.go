@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	ComponentName = "openapi_client"
+	ComponentName = "openapi_call"
 	RequestPort   = "request"
 	ResponsePort  = "response"
 	ErrorPort     = "error"
