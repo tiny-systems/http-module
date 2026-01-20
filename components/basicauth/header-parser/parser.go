@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	ComponentName        = "auth_header_parser"
+	ComponentName        = "http_auth_parse"
 	InPort        string = "in"
 	OutPort       string = "out"
 )

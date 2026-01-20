@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	ComponentName = "http_client"
+	ComponentName = "http_request"
 	RequestPort   = "request"
 	ResponsePort  = "response"
 	ErrorPort     = "error"
