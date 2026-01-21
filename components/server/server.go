@@ -246,8 +246,7 @@ func (h *Component) handleSettings(msg interface{}) error {
 }
 
 func (h *Component) handleResponse(msg interface{}) any {
-	log.Debug().
-		Interface("msg", msg).
+	log.Info().
 		Str("type", fmt.Sprintf("%T", msg)).
 		Bool("isNil", msg == nil).
 		Msg("http_server: handleResponse received")
@@ -264,6 +263,11 @@ func (h *Component) handleResponse(msg interface{}) any {
 	if in.StatusCode == 0 && in.Body == "" && in.ContentType == "" {
 		log.Warn().Msg("http_server: handleResponse - received empty Response (all zero values)")
 	}
+
+	log.Info().
+		Int("statusCode", in.StatusCode).
+		Int("bodyLen", len(in.Body)).
+		Msg("http_server: handleResponse returning")
 
 	return in
 }
@@ -465,12 +469,11 @@ func (h *Component) createEchoServer(handler module.Handler) *echo.Echo {
 func (h *Component) handleHTTPRequest(c echo.Context, handler module.Handler) error {
 	req := h.buildRequest(c)
 
-	log.Debug().Str("uri", req.RequestURI).Str("method", req.Method).Msg("http_server: handling request")
+	log.Info().Str("uri", req.RequestURI).Str("method", req.Method).Msg("http_server: handling request")
 
 	resp := handler(c.Request().Context(), RequestPort, req)
 
-	log.Debug().
-		Interface("resp", resp).
+	log.Info().
 		Str("type", fmt.Sprintf("%T", resp)).
 		Bool("isNil", resp == nil).
 		Msg("http_server: handler returned")
@@ -491,9 +494,16 @@ func (h *Component) handleHTTPRequest(c echo.Context, handler module.Handler) er
 
 	if respObj.StatusCode == 0 && respObj.Body == "" && respObj.ContentType == "" {
 		log.Warn().
-			Interface("resp", respObj).
+			Int("statusCode", respObj.StatusCode).
+			Str("body", respObj.Body).
+			Str("contentType", string(respObj.ContentType)).
 			Msg("http_server: response appears empty (zero values)")
 	}
+
+	log.Info().
+		Int("statusCode", respObj.StatusCode).
+		Int("bodyLen", len(respObj.Body)).
+		Msg("http_server: writing response")
 
 	h.writeResponse(c, respObj)
 	return nil
