@@ -60,6 +60,10 @@ type Component struct {
 	handler    module.Handler
 
 	portMgr *portmanager.Manager
+
+	// serverDone is closed when the server stops, allowing waiters to unblock
+	serverDone     chan struct{}
+	serverDoneLock *sync.Mutex
 }
 
 func (h *Component) Instance() module.Component {
@@ -70,6 +74,7 @@ func (h *Component) Instance() module.Component {
 		startStopLock:        &sync.Mutex{},
 		listenPortLock:       &sync.RWMutex{},
 		settingsLock:         &sync.Mutex{},
+		serverDoneLock:       &sync.Mutex{},
 		startSettings: Start{
 			WriteTimeout: 10,
 			ReadTimeout:  60,
@@ -186,6 +191,18 @@ func (h *Component) getListenPort() int {
 	return h.listenPort
 }
 
+func (h *Component) getServerDone() chan struct{} {
+	h.serverDoneLock.Lock()
+	defer h.serverDoneLock.Unlock()
+	return h.serverDone
+}
+
+func (h *Component) setServerDone(done chan struct{}) {
+	h.serverDoneLock.Lock()
+	defer h.serverDoneLock.Unlock()
+	h.serverDone = done
+}
+
 // Handle dispatches to port-specific handlers
 
 func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
@@ -229,10 +246,25 @@ func (h *Component) handleSettings(msg interface{}) error {
 }
 
 func (h *Component) handleResponse(msg interface{}) any {
+	log.Debug().
+		Interface("msg", msg).
+		Str("type", fmt.Sprintf("%T", msg)).
+		Bool("isNil", msg == nil).
+		Msg("http_server: handleResponse received")
+
 	in, ok := msg.(Response)
 	if !ok {
-		return fmt.Errorf("invalid response message")
+		log.Error().
+			Interface("msg", msg).
+			Str("type", fmt.Sprintf("%T", msg)).
+			Msg("http_server: handleResponse - msg is not Response type")
+		return fmt.Errorf("invalid response message: got %T", msg)
 	}
+
+	if in.StatusCode == 0 && in.Body == "" && in.ContentType == "" {
+		log.Warn().Msg("http_server: handleResponse - received empty Response (all zero values)")
+	}
+
 	return in
 }
 
@@ -335,8 +367,11 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 
 	h.persistStartConfig(handler, in)
 
-	if h.isRunning() {
-		log.Info().Msg("http_server: already running, skipping start")
+	// If server is already running, wait for it to stop (blocking behavior for ticker)
+	if done := h.getServerDone(); done != nil {
+		log.Info().Msg("http_server: already running, waiting for server to stop")
+		<-done
+		log.Info().Msg("http_server: server stopped, returning from Start")
 		return nil
 	}
 
@@ -378,6 +413,14 @@ func (h *Component) runServer(ctx context.Context, handler module.Handler) error
 	}
 
 	log.Info().Msg("http-server: entering")
+
+	// Create serverDone channel so other callers can wait for server to stop
+	done := make(chan struct{})
+	h.setServerDone(done)
+	defer func() {
+		h.setServerDone(nil)
+		close(done)
+	}()
 
 	e := h.createEchoServer(handler)
 	serverCtx, serverCancel := context.WithCancel(ctx)
@@ -422,14 +465,34 @@ func (h *Component) createEchoServer(handler module.Handler) *echo.Echo {
 func (h *Component) handleHTTPRequest(c echo.Context, handler module.Handler) error {
 	req := h.buildRequest(c)
 
+	log.Debug().Str("uri", req.RequestURI).Str("method", req.Method).Msg("http_server: handling request")
+
 	resp := handler(c.Request().Context(), RequestPort, req)
+
+	log.Debug().
+		Interface("resp", resp).
+		Str("type", fmt.Sprintf("%T", resp)).
+		Bool("isNil", resp == nil).
+		Msg("http_server: handler returned")
+
 	if err := moduleutils.CheckForError(resp); err != nil {
+		log.Error().Err(err).Msg("http_server: handler returned error")
 		return err
 	}
 
 	respObj, ok := resp.(Response)
 	if !ok {
-		return fmt.Errorf("invalid response")
+		log.Error().
+			Interface("resp", resp).
+			Str("type", fmt.Sprintf("%T", resp)).
+			Msg("http_server: response is not Response type")
+		return fmt.Errorf("invalid response: got %T", resp)
+	}
+
+	if respObj.StatusCode == 0 && respObj.Body == "" && respObj.ContentType == "" {
+		log.Warn().
+			Interface("resp", respObj).
+			Msg("http_server: response appears empty (zero values)")
 	}
 
 	h.writeResponse(c, respObj)
