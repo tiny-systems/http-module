@@ -484,7 +484,12 @@ func (h *Component) writeResponse(c echo.Context, resp Response) {
 		c.Response().Header().Set(etc.HeaderContentType, string(resp.ContentType))
 	}
 
-	_ = c.String(resp.StatusCode, fmt.Sprintf("%v", resp.Body))
+	statusCode := resp.StatusCode
+	if statusCode == 0 {
+		statusCode = 200
+	}
+
+	_ = c.String(statusCode, fmt.Sprintf("%v", resp.Body))
 }
 
 func (h *Component) watchParentContext(ctx context.Context, cancel context.CancelFunc) {
