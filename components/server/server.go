@@ -55,6 +55,10 @@ type Component struct {
 	listenPortLock *sync.RWMutex
 	listenPort     int
 
+	// lastExposedPort tracks the port from metadata to clean up if port changes on restart
+	lastExposedPortLock *sync.RWMutex
+	lastExposedPort     int
+
 	nodeName   string
 	sourceNode string
 	handler    module.Handler
@@ -73,6 +77,7 @@ func (h *Component) Instance() module.Component {
 		cancelFuncLock:       &sync.Mutex{},
 		startStopLock:        &sync.Mutex{},
 		listenPortLock:       &sync.RWMutex{},
+		lastExposedPortLock:  &sync.RWMutex{},
 		settingsLock:         &sync.Mutex{},
 		serverDoneLock:       &sync.Mutex{},
 		startSettings: Start{
@@ -316,7 +321,20 @@ func (h *Component) readPortFromMetadata(metadata map[string]string) int {
 	}
 
 	h.setListenPort(p)
+	h.setLastExposedPort(p)
 	return p
+}
+
+func (h *Component) setLastExposedPort(port int) {
+	h.lastExposedPortLock.Lock()
+	defer h.lastExposedPortLock.Unlock()
+	h.lastExposedPort = port
+}
+
+func (h *Component) getLastExposedPort() int {
+	h.lastExposedPortLock.RLock()
+	defer h.lastExposedPortLock.RUnlock()
+	return h.lastExposedPort
 }
 
 func (h *Component) readStartFromMetadata(metadata map[string]string) (Start, bool) {
@@ -619,6 +637,17 @@ func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handl
 }
 
 func (h *Component) exposePort(ctx context.Context, port int) []string {
+	// Clean up old port if it's different from the new one (e.g., after pod restart)
+	oldPort := h.getLastExposedPort()
+	if oldPort > 0 && oldPort != port && h.portMgr != nil {
+		log.Info().Int("oldPort", oldPort).Int("newPort", port).Msg("http-server: cleaning up old port before exposing new one")
+		discloseCtx, discloseCancel := context.WithTimeout(ctx, time.Second*30)
+		if err := h.portMgr.DisclosePort(discloseCtx, oldPort); err != nil {
+			log.Error().Err(err).Int("port", oldPort).Msg("http-server: failed to disclose old port")
+		}
+		discloseCancel()
+	}
+
 	exposeCtx, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
 
@@ -633,6 +662,9 @@ func (h *Component) exposePort(ctx context.Context, port int) []string {
 		log.Error().Err(err).Msg("failed to expose port")
 		return []string{fmt.Sprintf("http://localhost:%d", port)}
 	}
+
+	// Update last exposed port after successful expose
+	h.setLastExposedPort(port)
 
 	return publicURLs
 }
