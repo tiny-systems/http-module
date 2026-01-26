@@ -741,6 +741,34 @@ func (h *Component) Ports() []module.Port {
 }
 
 var _ module.Component = (*Component)(nil)
+var _ module.Destroyer = (*Component)(nil)
+
+// OnDestroy implements module.Destroyer interface.
+// Called when the node is being deleted (via finalizer) to clean up exposed ports.
+func (h *Component) OnDestroy(metadata map[string]string) {
+	if h.portMgr == nil {
+		return
+	}
+
+	portStr, ok := metadata[metadataKeyPort]
+	if !ok || portStr == "" {
+		return
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port == 0 {
+		return
+	}
+
+	log.Info().Int("port", port).Msg("http-server: cleaning up exposed port on destroy")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+
+	if err := h.portMgr.DisclosePort(ctx, port); err != nil {
+		log.Error().Err(err).Int("port", port).Msg("http-server: failed to disclose port on destroy")
+	}
+}
 
 func init() {
 	registry.Register((&Component{}).Instance())
