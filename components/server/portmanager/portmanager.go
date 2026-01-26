@@ -214,14 +214,34 @@ func (m *Manager) exposeServicePort(ctx context.Context, svc *v1core.Service, po
 		Port:       int32(port),
 		TargetPort: intstr.FromInt32(int32(port)),
 	})
-	log.Info().Int("port", port).Str("service", svc.Name).Msg("portmanager: updating service with new port")
+	log.Info().
+		Int("port", port).
+		Str("service", svc.Name).
+		Str("namespace", svc.Namespace).
+		Str("resourceVersion", svc.ResourceVersion).
+		Int("portsCount", len(svc.Spec.Ports)).
+		Msg("portmanager: updating service with new port")
+
 	err := m.client.Update(ctx, svc)
 	if err != nil {
 		log.Error().Err(err).Int("port", port).Str("service", svc.Name).Msg("portmanager: failed to update service")
-	} else {
-		log.Info().Int("port", port).Str("service", svc.Name).Msg("portmanager: service updated successfully")
+		return err
 	}
-	return err
+
+	// Verify the update by re-fetching
+	verifySvc := &v1core.Service{}
+	if verifyErr := m.client.Get(ctx, client.ObjectKey{Namespace: svc.Namespace, Name: svc.Name}, verifySvc); verifyErr != nil {
+		log.Error().Err(verifyErr).Msg("portmanager: failed to verify service update")
+	} else {
+		log.Info().
+			Int("port", port).
+			Str("service", svc.Name).
+			Int("verifiedPortsCount", len(verifySvc.Spec.Ports)).
+			Str("newResourceVersion", verifySvc.ResourceVersion).
+			Msg("portmanager: service update verified")
+	}
+
+	return nil
 }
 
 func (m *Manager) discloseServicePort(ctx context.Context, svc *v1core.Service, port int) error {
