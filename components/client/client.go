@@ -96,11 +96,16 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		ctx, cancel := context.WithTimeout(ctx, time.Second*time.Duration(in.Timeout))
 		defer cancel()
 
-		var requestBody []byte
+		requestBody := []byte(in.Body)
 
 		req, err := http.NewRequestWithContext(ctx, in.Method, in.URL, bytes.NewReader(requestBody))
 		if err != nil {
 			return err
+		}
+
+		// Set Content-Type header
+		if in.ContentType != "" {
+			req.Header.Set("Content-Type", string(in.ContentType))
 		}
 
 		for _, header := range in.Headers {
