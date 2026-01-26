@@ -203,45 +203,48 @@ func (m *Manager) getIngressAutoHostnamePrefix(ingress *v1ingress.Ingress) strin
 }
 
 func (m *Manager) exposeServicePort(ctx context.Context, svc *v1core.Service, port int) error {
-	for _, p := range svc.Spec.Ports {
-		if p.Port == int32(port) {
-			log.Info().Int("port", port).Msg("portmanager: port already exposed on service")
+	maxRetries := 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Always fetch fresh service to avoid race with other replicas
+		freshSvc := &v1core.Service{}
+		if err := m.client.Get(ctx, client.ObjectKey{Namespace: svc.Namespace, Name: svc.Name}, freshSvc); err != nil {
+			return fmt.Errorf("failed to get service: %w", err)
+		}
+
+		// Check if port already exists
+		for _, p := range freshSvc.Spec.Ports {
+			if p.Port == int32(port) {
+				log.Info().Int("port", port).Msg("portmanager: port already exposed on service")
+				return nil
+			}
+		}
+
+		// Add port
+		freshSvc.Spec.Ports = append(freshSvc.Spec.Ports, v1core.ServicePort{
+			Name:       fmt.Sprintf("port%d", port),
+			Port:       int32(port),
+			TargetPort: intstr.FromInt32(int32(port)),
+			Protocol:   v1core.ProtocolTCP,
+		})
+
+		log.Info().Int("port", port).Str("service", svc.Name).Int("attempt", attempt+1).Msg("portmanager: updating service")
+
+		err := m.client.Update(ctx, freshSvc)
+		if err == nil {
+			log.Info().Int("port", port).Str("service", svc.Name).Msg("portmanager: service port added")
 			return nil
 		}
-	}
-	svc.Spec.Ports = append(svc.Spec.Ports, v1core.ServicePort{
-		Name:       fmt.Sprintf("port%d", port),
-		Port:       int32(port),
-		TargetPort: intstr.FromInt32(int32(port)),
-	})
-	log.Info().
-		Int("port", port).
-		Str("service", svc.Name).
-		Str("namespace", svc.Namespace).
-		Str("resourceVersion", svc.ResourceVersion).
-		Int("portsCount", len(svc.Spec.Ports)).
-		Msg("portmanager: updating service with new port")
 
-	err := m.client.Update(ctx, svc)
-	if err != nil {
-		log.Error().Err(err).Int("port", port).Str("service", svc.Name).Msg("portmanager: failed to update service")
-		return err
+		if errors.IsConflict(err) {
+			log.Warn().Int("port", port).Int("attempt", attempt+1).Msg("portmanager: conflict, retrying")
+			time.Sleep(time.Millisecond * 100 * time.Duration(attempt+1))
+			continue
+		}
+
+		return fmt.Errorf("failed to update service: %w", err)
 	}
 
-	// Verify the update by re-fetching
-	verifySvc := &v1core.Service{}
-	if verifyErr := m.client.Get(ctx, client.ObjectKey{Namespace: svc.Namespace, Name: svc.Name}, verifySvc); verifyErr != nil {
-		log.Error().Err(verifyErr).Msg("portmanager: failed to verify service update")
-	} else {
-		log.Info().
-			Int("port", port).
-			Str("service", svc.Name).
-			Int("verifiedPortsCount", len(verifySvc.Spec.Ports)).
-			Str("newResourceVersion", verifySvc.ResourceVersion).
-			Msg("portmanager: service update verified")
-	}
-
-	return nil
+	return fmt.Errorf("failed to add port after %d retries", maxRetries)
 }
 
 func (m *Manager) discloseServicePort(ctx context.Context, svc *v1core.Service, port int) error {
