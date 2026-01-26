@@ -205,6 +205,7 @@ func (m *Manager) getIngressAutoHostnamePrefix(ingress *v1ingress.Ingress) strin
 func (m *Manager) exposeServicePort(ctx context.Context, svc *v1core.Service, port int) error {
 	for _, p := range svc.Spec.Ports {
 		if p.Port == int32(port) {
+			log.Info().Int("port", port).Msg("portmanager: port already exposed on service")
 			return nil
 		}
 	}
@@ -213,7 +214,14 @@ func (m *Manager) exposeServicePort(ctx context.Context, svc *v1core.Service, po
 		Port:       int32(port),
 		TargetPort: intstr.FromInt32(int32(port)),
 	})
-	return m.client.Update(ctx, svc)
+	log.Info().Int("port", port).Str("service", svc.Name).Msg("portmanager: updating service with new port")
+	err := m.client.Update(ctx, svc)
+	if err != nil {
+		log.Error().Err(err).Int("port", port).Str("service", svc.Name).Msg("portmanager: failed to update service")
+	} else {
+		log.Info().Int("port", port).Str("service", svc.Name).Msg("portmanager: service updated successfully")
+	}
+	return err
 }
 
 func (m *Manager) discloseServicePort(ctx context.Context, svc *v1core.Service, port int) error {
@@ -307,8 +315,10 @@ func (m *Manager) addRulesIngress(ctx context.Context, ingress *v1ingress.Ingres
 			}
 		}
 
+		log.Info().Str("ingress", ingress.Name).Int("rulesCount", len(ingress.Spec.Rules)).Msg("portmanager: updating ingress")
 		err := m.client.Update(ctx, ingress)
 		if err == nil {
+			log.Info().Str("ingress", ingress.Name).Strs("hostnames", hostnames).Msg("portmanager: ingress updated successfully")
 			return hostnames, nil
 		}
 
@@ -317,6 +327,7 @@ func (m *Manager) addRulesIngress(ctx context.Context, ingress *v1ingress.Ingres
 			continue
 		}
 
+		log.Error().Err(err).Str("ingress", ingress.Name).Msg("portmanager: failed to update ingress")
 		return []string{}, err
 	}
 
