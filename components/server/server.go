@@ -231,11 +231,16 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 }
 
 func (h *Component) handleClient(msg interface{}) error {
+	log.Info().Str("msgType", fmt.Sprintf("%T", msg)).Msg("http-server: handleClient called")
+
 	k8sProvider, ok := msg.(module.K8sClient)
 	if !ok {
+		log.Warn().Str("msgType", fmt.Sprintf("%T", msg)).Msg("http-server: msg does not implement K8sClient")
 		return nil
 	}
+
 	h.portMgr = portmanager.New(k8sProvider.GetK8sClient(), k8sProvider.GetNamespace())
+	log.Info().Str("namespace", k8sProvider.GetNamespace()).Msg("http-server: portMgr initialized")
 	return nil
 }
 
@@ -637,9 +642,16 @@ func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handl
 }
 
 func (h *Component) exposePort(ctx context.Context, port int) []string {
+	log.Info().Int("port", port).Bool("hasPortMgr", h.portMgr != nil).Msg("http-server: exposePort called")
+
+	if h.portMgr == nil {
+		log.Error().Int("port", port).Msg("http-server: portMgr is nil, cannot expose port")
+		return []string{fmt.Sprintf("http://localhost:%d", port)}
+	}
+
 	// Clean up old port if it's different from the new one (e.g., after pod restart)
 	oldPort := h.getLastExposedPort()
-	if oldPort > 0 && oldPort != port && h.portMgr != nil {
+	if oldPort > 0 && oldPort != port {
 		log.Info().Int("oldPort", oldPort).Int("newPort", port).Msg("http-server: cleaning up old port before exposing new one")
 		discloseCtx, discloseCancel := context.WithTimeout(ctx, time.Second*30)
 		if err := h.portMgr.DisclosePort(discloseCtx, oldPort); err != nil {
@@ -657,11 +669,19 @@ func (h *Component) exposePort(ctx context.Context, port int) []string {
 		autoHostName = parts[len(parts)-1]
 	}
 
+	log.Info().
+		Int("port", port).
+		Str("autoHostName", autoHostName).
+		Strs("hostnames", h.startSettings.Hostnames).
+		Msg("http-server: calling portMgr.ExposePort")
+
 	publicURLs, err := h.portMgr.ExposePort(exposeCtx, autoHostName, h.startSettings.Hostnames, port)
 	if err != nil {
-		log.Error().Err(err).Msg("failed to expose port")
+		log.Error().Err(err).Int("port", port).Msg("http-server: failed to expose port")
 		return []string{fmt.Sprintf("http://localhost:%d", port)}
 	}
+
+	log.Info().Int("port", port).Strs("publicURLs", publicURLs).Msg("http-server: port exposed successfully")
 
 	// Update last exposed port after successful expose
 	h.setLastExposedPort(port)
