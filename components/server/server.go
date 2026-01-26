@@ -710,11 +710,10 @@ func (h *Component) shutdownServer(e *echo.Echo, actualPort int) {
 	h.setCancelFunc(nil)
 	h.setListenPort(0)
 
-	if actualPort > 0 {
-		discloseCtx, discloseCancel := context.WithTimeout(context.Background(), time.Second*30)
-		defer discloseCancel()
-		_ = h.portMgr.DisclosePort(discloseCtx, actualPort)
-	}
+	// NOTE: We intentionally do NOT call DisclosePort here.
+	// During rolling updates, the new pod exposes ports before the old pod shuts down.
+	// If we disclose here, we'd remove ports that the new pod just added.
+	// Port cleanup only happens in OnDestroy() when the TinyNode CRD is deleted.
 
 	h.setPublicListenAddr([]string{})
 	log.Info().Msg("http-server: exiting")
