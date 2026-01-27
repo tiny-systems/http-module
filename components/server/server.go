@@ -402,6 +402,21 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 		return nil
 	}
 
+	// Wait for listenPort to be set by _reconcile if it's still 0
+	// This handles the race where Start signal arrives before _reconcile completes
+	if h.getListenPort() == 0 {
+		log.Info().Msg("http_server: listenPort is 0, waiting for _reconcile to set it")
+		deadline := time.Now().Add(5 * time.Second)
+		for h.getListenPort() == 0 && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if port := h.getListenPort(); port > 0 {
+			log.Info().Int("port", port).Msg("http_server: listenPort set by _reconcile")
+		} else {
+			log.Warn().Msg("http_server: listenPort still 0 after waiting, will use random port")
+		}
+	}
+
 	log.Info().Msg("http_server: starting server from StartPort")
 	err := h.runServer(ctx, handler)
 
