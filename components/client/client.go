@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"time"
+
 	"github.com/tiny-systems/http-module/components/etc"
 	"github.com/tiny-systems/module/api/v1alpha1"
 	"github.com/tiny-systems/module/module"
 	"github.com/tiny-systems/module/registry"
-	"io"
-	"net/http"
-	"strings"
-	"time"
 )
 
 const (
@@ -96,14 +96,11 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		ctx, cancel := context.WithTimeout(ctx, time.Second*time.Duration(in.Timeout))
 		defer cancel()
 
-		requestBody := []byte(in.Body)
-
-		req, err := http.NewRequestWithContext(ctx, in.Method, in.URL, bytes.NewReader(requestBody))
+		req, err := http.NewRequestWithContext(ctx, in.Method, in.URL, bytes.NewReader([]byte(in.Body)))
 		if err != nil {
 			return err
 		}
 
-		// Set Content-Type header
 		if in.ContentType != "" {
 			req.Header.Set("Content-Type", string(in.ContentType))
 		}
@@ -112,23 +109,19 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			req.Header.Set(header.Key, header.Value)
 		}
 
-		c := http.Client{}
-		resp, err := c.Do(req)
+		client := http.Client{}
+		resp, err := client.Do(req)
 		if err != nil {
 			return err
 		}
-		defer func() {
-			_ = resp.Body.Close()
-		}()
+		defer resp.Body.Close()
 
 		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
 		}
 
-		builder := strings.Builder{}
-		builder.Write(b)
-		result := builder.String()
+		result := string(b)
 
 		var headers []etc.Header
 		for k, v := range resp.Header {
@@ -141,11 +134,9 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		}
 
 		if resp.StatusCode >= 400 && h.settings.EnableErrorPort {
-			// error range
-			// send to error port
 			return handler(ctx, ErrorPort, Error{
 				Context: in.Context,
-				Error:   fmt.Sprint(result),
+				Error:   result,
 				Response: ResponseResponse{
 					Body:       result,
 					Headers:    headers,
@@ -153,7 +144,6 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 					StatusCode: resp.StatusCode,
 				},
 			})
-
 		}
 
 		return handler(ctx, ResponsePort, Response{

@@ -93,7 +93,10 @@ func (h *Component) Instance() module.Component {
 
 type Settings struct {
 	EnableStatusPort bool `json:"enableStatusPort" required:"true" title:"Enable status port" description:"Status port notifies when server is up or down"`
+	MaxBodySize      int  `json:"maxBodySize" title:"Max Body Size (MB)" description:"Maximum request body size in megabytes. 0 means use default (10MB)."`
 }
+
+const defaultMaxBodySize = 10 * 1024 * 1024 // 10MB
 
 type StartContext any
 
@@ -560,12 +563,23 @@ func (h *Component) buildRequest(c echo.Context) Request {
 		PodName:       os.Getenv("HOSTNAME"),
 	}
 
-	body, err := io.ReadAll(c.Request().Body)
+	maxBodySize := h.getMaxBodySize()
+	limitedReader := io.LimitReader(c.Request().Body, int64(maxBodySize))
+	body, err := io.ReadAll(limitedReader)
 	if err == nil {
 		req.Body = utils.BytesToString(body)
 	}
 
 	return req
+}
+
+func (h *Component) getMaxBodySize() int {
+	h.settingsLock.Lock()
+	defer h.settingsLock.Unlock()
+	if h.settings.MaxBodySize > 0 {
+		return h.settings.MaxBodySize * 1024 * 1024 // Convert MB to bytes
+	}
+	return defaultMaxBodySize
 }
 
 func (h *Component) extractHeaders(r *http.Request) []etc.Header {
