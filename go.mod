@@ -13,7 +13,7 @@ require (
 	github.com/spf13/cobra v1.10.1
 	github.com/spf13/viper v1.19.0
 	github.com/swaggest/jsonschema-go v0.3.70
-	github.com/tiny-systems/module v0.1.266
+	github.com/tiny-systems/module v0.1.289
 	k8s.io/api v0.34.0
 	k8s.io/apimachinery v0.34.0
 	sigs.k8s.io/controller-runtime v0.20.2
@@ -148,7 +148,7 @@ require (
 	github.com/tiny-systems/ajson v0.1.6 // indirect
 	github.com/tiny-systems/errorpanic v0.7.1 // indirect
 	github.com/tiny-systems/otel-collector v0.5.1 // indirect
-	github.com/tiny-systems/platform-api v0.0.14 // indirect
+	github.com/tiny-systems/platform-api v0.0.15 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	github.com/vmware-labs/yaml-jsonpath v0.3.2 // indirect
