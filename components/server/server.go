@@ -468,11 +468,13 @@ func (h *Component) runServer(ctx context.Context, handler module.Handler) error
 	}()
 
 	e := h.createEchoServer(handler)
-	serverCtx, serverCancel := context.WithCancel(ctx)
+	// Use Background context - server is long-running and shouldn't inherit caller's deadline
+	// The gRPC request context has a timeout that would cancel the server prematurely
+	// Server stops via nil message on StartPort when edge is deleted
+	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
 
 	h.setCancelFunc(serverCancel)
-	h.watchParentContext(ctx, serverCancel)
 
 	listenAddr := h.determineListenAddr()
 
@@ -615,14 +617,6 @@ func (h *Component) writeResponse(c echo.Context, resp Response) {
 	}
 
 	_ = c.String(statusCode, fmt.Sprintf("%v", resp.Body))
-}
-
-func (h *Component) watchParentContext(ctx context.Context, cancel context.CancelFunc) {
-	go func() {
-		<-ctx.Done()
-		log.Info().Msg("http-server: parent context cancelled, stopping server")
-		cancel()
-	}()
 }
 
 func (h *Component) determineListenAddr() string {
