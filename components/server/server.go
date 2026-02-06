@@ -433,8 +433,9 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 	log.Info().Err(err).Msg("http_server: server stopped")
 	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 
-	// Do NOT clear metadata on ctx cancellation — the server will be
-	// restored from metadata by reconcile with context.Background().
+	if ctx.Err() != nil {
+		h.clearStartMetadata(handler)
+	}
 	return err
 }
 
