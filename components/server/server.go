@@ -397,9 +397,6 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 
 	h.persistStartConfig(handler, in)
 
-	// If server is already running, block to maintain blocking I/O semantics.
-	// When ctx is cancelled (gRPC timeout), return nil — do NOT clear metadata.
-	// Clearing metadata caused reconcile to permanently kill the server.
 	if done := h.getServerDone(); done != nil {
 		log.Info().Msg("http_server: already running, waiting for server to stop")
 		select {
@@ -407,7 +404,8 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 			log.Info().Msg("http_server: server stopped, returning from Start")
 			return nil
 		case <-ctx.Done():
-			log.Info().Msg("http_server: context cancelled while waiting, server continues")
+			h.stop()
+			h.clearStartMetadata(handler)
 			return nil
 		}
 	}
@@ -433,6 +431,9 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 	log.Info().Err(err).Msg("http_server: server stopped")
 	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 
+	if ctx.Err() != nil {
+		h.clearStartMetadata(handler)
+	}
 	return err
 }
 
