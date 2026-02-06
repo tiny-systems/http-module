@@ -397,18 +397,12 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 
 	h.persistStartConfig(handler, in)
 
-	// If server is already running, wait for it to stop (blocking behavior for ticker)
-	if done := h.getServerDone(); done != nil {
-		log.Info().Msg("http_server: already running, waiting for server to stop")
-		select {
-		case <-done:
-			log.Info().Msg("http_server: server stopped, returning from Start")
-			return nil
-		case <-ctx.Done():
-			log.Info().Msg("http_server: context cancelled while waiting for server to stop")
-			h.clearStartMetadata(handler)
-			return ctx.Err()
-		}
+	// If server is already running, just acknowledge — don't block Handle().
+	// Blocking here causes the gRPC request context to time out,
+	// which clears metadata and kills the server permanently.
+	if h.isRunning() {
+		log.Info().Msg("http_server: already running, acknowledging start")
+		return nil
 	}
 
 	// Wait for listenPort to be set by _reconcile if it's still 0
@@ -426,19 +420,17 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 		}
 	}
 
+	// Start server asynchronously — Handle() must not block on long-running I/O.
+	// The gRPC request context has a deadline that would kill the server.
+	// Server lifetime is controlled via h.stop() and reconcile metadata.
 	log.Info().Msg("http_server: starting server from StartPort")
-	err := h.runServer(ctx, handler)
+	go func() {
+		err := h.runServer(context.Background(), handler)
+		log.Info().Err(err).Msg("http_server: server stopped")
+		_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
+	}()
 
-	log.Info().Err(err).Msg("http_server: server stopped")
-	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
-
-	// If upstream cancelled (e.g. ticker stopped), clear metadata
-	// so reconciliation doesn't restart the server
-	if ctx.Err() != nil {
-		h.clearStartMetadata(handler)
-	}
-
-	return err
+	return nil
 }
 
 func (h *Component) parseStartConfig(msg interface{}) Start {
@@ -490,20 +482,11 @@ func (h *Component) runServer(ctx context.Context, handler module.Handler) error
 	}()
 
 	e := h.createEchoServer(handler)
-	// Use Background context - server is long-running and shouldn't inherit caller's deadline
-	// The gRPC request context has a timeout that would cancel the server prematurely
-	// Server stops via nil message on StartPort when edge is deleted
+	// Use Background context - server is long-running and shouldn't inherit caller's deadline.
+	// No bridge from parent ctx: server lifetime is controlled via h.stop() and reconcile.
+	// Bridging parent ctx caused the server to die on gRPC request timeout.
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
-
-	// Bridge: cancel server when parent context is done (e.g., upstream ticker stopped)
-	go func() {
-		select {
-		case <-ctx.Done():
-			serverCancel()
-		case <-serverCtx.Done():
-		}
-	}()
 
 	h.setCancelFunc(serverCancel)
 
