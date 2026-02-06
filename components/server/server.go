@@ -400,9 +400,14 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 	// If server is already running, wait for it to stop (blocking behavior for ticker)
 	if done := h.getServerDone(); done != nil {
 		log.Info().Msg("http_server: already running, waiting for server to stop")
-		<-done
-		log.Info().Msg("http_server: server stopped, returning from Start")
-		return nil
+		select {
+		case <-done:
+			log.Info().Msg("http_server: server stopped, returning from Start")
+			return nil
+		case <-ctx.Done():
+			log.Info().Msg("http_server: context cancelled while waiting for server to stop")
+			return ctx.Err()
+		}
 	}
 
 	// Wait for listenPort to be set by _reconcile if it's still 0
@@ -474,13 +479,30 @@ func (h *Component) runServer(ctx context.Context, handler module.Handler) error
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
 
+	// Bridge: cancel server when parent context is done (e.g., upstream ticker stopped)
+	go func() {
+		select {
+		case <-ctx.Done():
+			serverCancel()
+		case <-serverCtx.Done():
+		}
+	}()
+
 	h.setCancelFunc(serverCancel)
 
 	listenAddr := h.determineListenAddr()
 
 	go h.startEchoServer(e, listenAddr, serverCancel)
 
-	time.Sleep(time.Millisecond * 1500)
+	// Poll for Echo to bind its listener instead of fixed sleep
+	deadline := time.Now().Add(5 * time.Second)
+	for e.Listener == nil && time.Now().Before(deadline) {
+		select {
+		case <-serverCtx.Done():
+			return serverCtx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 
 	actualPort, err := h.handleServerStarted(ctx, e, handler)
 	if err != nil {
