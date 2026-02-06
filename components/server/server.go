@@ -406,6 +406,7 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 			return nil
 		case <-ctx.Done():
 			log.Info().Msg("http_server: context cancelled while waiting for server to stop")
+			h.clearStartMetadata(handler)
 			return ctx.Err()
 		}
 	}
@@ -431,6 +432,12 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 	log.Info().Err(err).Msg("http_server: server stopped")
 	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 
+	// If upstream cancelled (e.g. ticker stopped), clear metadata
+	// so reconciliation doesn't restart the server
+	if ctx.Err() != nil {
+		h.clearStartMetadata(handler)
+	}
+
 	return err
 }
 
@@ -451,6 +458,16 @@ func (h *Component) persistStartConfig(handler module.Handler, cfg Start) {
 			n.Status.Metadata = make(map[string]string)
 		}
 		n.Status.Metadata[metadataKeyStart] = string(startBytes)
+		return nil
+	})
+}
+
+func (h *Component) clearStartMetadata(handler module.Handler) {
+	_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+		if n.Status.Metadata == nil {
+			return nil
+		}
+		delete(n.Status.Metadata, metadataKeyStart)
 		return nil
 	})
 }
