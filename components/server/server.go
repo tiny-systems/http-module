@@ -303,6 +303,11 @@ func (h *Component) handleReconcile(msg interface{}, handler module.Handler) {
 	}
 
 	if h.isRunning() {
+		// If start metadata was cleared (e.g. ticker stopped), stop the server
+		if _, ok := h.readStartFromMetadata(node.Status.Metadata); !ok {
+			log.Info().Msg("http_server: start metadata cleared, stopping running server")
+			_ = h.stop()
+		}
 		return
 	}
 
