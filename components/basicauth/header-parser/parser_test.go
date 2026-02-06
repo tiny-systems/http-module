@@ -103,7 +103,7 @@ func TestComponent_Handle(t1 *testing.T) {
 		},
 		{
 			name:    "Auth headers, all good",
-			wantErr: true,
+			wantErr: false,
 			args: args{
 				ctx:  context.Background(),
 				port: InPort,
