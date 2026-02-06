@@ -380,6 +380,10 @@ func (h *Component) startFromMetadata(handler module.Handler, port int) {
 	if err := h.runServer(context.Background(), handler); err != nil {
 		log.Error().Err(err).Msg("http_server: server stopped after metadata restoration")
 	}
+
+	// Push updated status so UI shows "Not running"
+	_ = handler(context.Background(), v1alpha1.ControlPort, h.getControl())
+	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
 }
 
 func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg interface{}) error {
@@ -411,6 +415,12 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 		case <-ctx.Done():
 			h.stop()
 			h.clearStartMetadata(handler)
+			// Disclose port — this is an intentional stop (ticker cancelled), not a rolling update
+			if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
+				dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_ = h.portMgr.DisclosePort(dCtx, port)
+				dCancel()
+			}
 			return nil
 		}
 	}
@@ -438,6 +448,11 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 
 	if ctx.Err() != nil {
 		h.clearStartMetadata(handler)
+		if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
+			dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = h.portMgr.DisclosePort(dCtx, port)
+			dCancel()
+		}
 	}
 	return err
 }
