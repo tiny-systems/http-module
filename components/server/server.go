@@ -875,6 +875,7 @@ var _ module.Destroyer = (*Component)(nil)
 // OnDestroy implements module.Destroyer interface.
 // Called when the node is being deleted (via finalizer) to clean up exposed ports.
 func (h *Component) OnDestroy(metadata map[string]string) {
+	h.stop()
 	if h.portMgr == nil {
 		return
 	}
