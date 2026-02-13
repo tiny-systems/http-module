@@ -92,73 +92,79 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 		if !ok {
 			return fmt.Errorf("invalid message")
 		}
-
-		ctx, cancel := context.WithTimeout(ctx, time.Second*time.Duration(in.Timeout))
-		defer cancel()
-
-		req, err := http.NewRequestWithContext(ctx, in.Method, in.URL, bytes.NewReader([]byte(in.Body)))
-		if err != nil {
-			return err
-		}
-
-		if in.ContentType != "" {
-			req.Header.Set("Content-Type", string(in.ContentType))
-		}
-
-		for _, header := range in.Headers {
-			req.Header.Set(header.Key, header.Value)
-		}
-
-		client := http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		b, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-
-		result := string(b)
-
-		var headers []etc.Header
-		for k, v := range resp.Header {
-			for _, vv := range v {
-				headers = append(headers, etc.Header{
-					Key:   k,
-					Value: vv,
-				})
-			}
-		}
-
-		if resp.StatusCode >= 400 && h.settings.EnableErrorPort {
-			return handler(ctx, ErrorPort, Error{
-				Context: in.Context,
-				Error:   result,
-				Response: ResponseResponse{
-					Body:       result,
-					Headers:    headers,
-					Status:     resp.Status,
-					StatusCode: resp.StatusCode,
-				},
-			})
-		}
-
-		return handler(ctx, ResponsePort, Response{
-			Response: ResponseResponse{
-				Body:       result,
-				Headers:    headers,
-				Status:     resp.Status,
-				StatusCode: resp.StatusCode,
-			},
-			Context: in.Context,
-		})
+		return h.doRequest(ctx, handler, in)
 
 	default:
 		return fmt.Errorf("port %s is not supoprted", port)
 	}
+}
+
+func (h *Component) doRequest(ctx context.Context, handler module.Handler, in Request) any {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*time.Duration(in.Timeout))
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, in.Method, in.URL, bytes.NewReader([]byte(in.Body)))
+	if err != nil {
+		return h.handleError(ctx, handler, in.Context, err, ResponseResponse{})
+	}
+
+	if in.ContentType != "" {
+		req.Header.Set("Content-Type", string(in.ContentType))
+	}
+
+	for _, header := range in.Headers {
+		req.Header.Set(header.Key, header.Value)
+	}
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return h.handleError(ctx, handler, in.Context, err, ResponseResponse{})
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return h.handleError(ctx, handler, in.Context, err, ResponseResponse{})
+	}
+
+	body := string(b)
+
+	var headers []etc.Header
+	for k, v := range resp.Header {
+		for _, vv := range v {
+			headers = append(headers, etc.Header{
+				Key:   k,
+				Value: vv,
+			})
+		}
+	}
+
+	respData := ResponseResponse{
+		Body:       body,
+		Headers:    headers,
+		Status:     resp.Status,
+		StatusCode: resp.StatusCode,
+	}
+
+	if resp.StatusCode >= 400 {
+		return h.handleError(ctx, handler, in.Context, fmt.Errorf("%s", body), respData)
+	}
+
+	return handler(ctx, ResponsePort, Response{
+		Response: respData,
+		Context:  in.Context,
+	})
+}
+
+func (h *Component) handleError(ctx context.Context, handler module.Handler, reqContext Context, err error, resp ResponseResponse) any {
+	if !h.settings.EnableErrorPort {
+		return err
+	}
+	return handler(ctx, ErrorPort, Error{
+		Context:  reqContext,
+		Error:    err.Error(),
+		Response: resp,
+	})
 }
 
 func (h *Component) Ports() []module.Port {
