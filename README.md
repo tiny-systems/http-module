@@ -13,3 +13,7 @@ Run locally
  HOSTNAME=http-1 OTLP_DSN=http://test.token@localhost:2345 go run cmd/main.go run --name localsecond/http-module-v1 --namespace=tinysystems --version=1.0.5
 
 ```
+
+## License
+
+This module's source code is MIT-licensed. It depends on the [TinySystems Module SDK](https://github.com/tiny-systems/module) (BSL 1.1). See [LICENSE](LICENSE) for details.
