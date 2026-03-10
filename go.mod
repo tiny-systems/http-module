@@ -1,8 +1,8 @@
 module github.com/tiny-systems/http-module
 
-go 1.24.2
+go 1.25.0
 
-toolchain go1.24.9
+toolchain go1.25.5
 
 require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
@@ -13,7 +13,7 @@ require (
 	github.com/spf13/cobra v1.10.1
 	github.com/spf13/viper v1.19.0
 	github.com/swaggest/jsonschema-go v0.3.70
-	github.com/tiny-systems/module v0.1.346
+	github.com/tiny-systems/module v0.1.356
 	k8s.io/api v0.34.0
 	k8s.io/apimachinery v0.34.0
 	sigs.k8s.io/controller-runtime v0.20.2
