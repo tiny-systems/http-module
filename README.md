@@ -1,18 +1,33 @@
-# Tiny Systems HTTP module
-HTTP clients and servers
+# TinySystems HTTP Module
 
+HTTP server and client components for building web-facing automations.
 
+## Components
 
-### Build locally
+| Component | Description |
+|-----------|-------------|
+| HTTP Server | Embedded HTTP server with configurable routes and TLS support |
+| HTTP Client | Make outbound HTTP requests with full header and body control |
+| Basic Auth Parser | Parse and validate HTTP Basic Authentication headers |
+| OpenAPI Request | Make HTTP calls driven by an OpenAPI/Swagger specification |
+
+## Installation
+
 ```shell
-go run cmd/main.go tools build --devkey abcd11111e --name github.com/tiny-systems/http-module --version v1.0.5 --platform-api-url http://localhost:8281
+helm repo add tinysystems https://tiny-systems.github.io/module/
+helm install http-module tinysystems/tinysystems-operator \
+  --set controllerManager.manager.image.repository=ghcr.io/tiny-systems/http-module
 ```
 
-Run locally
-```shell
- HOSTNAME=http-1 OTLP_DSN=http://test.token@localhost:2345 go run cmd/main.go run --name localsecond/http-module-v1 --namespace=tinysystems --version=1.0.5
+## Run locally
 
+```shell
+go run cmd/main.go run --name=http-module --namespace=tinysystems --version=1.0.0
 ```
+
+## Part of TinySystems
+
+This module is part of the [TinySystems](https://github.com/tiny-systems) platform -- a visual flow-based automation engine running on Kubernetes.
 
 ## License
 
