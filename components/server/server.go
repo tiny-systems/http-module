@@ -67,11 +67,9 @@ type Component struct {
 	portMgr *portmanager.Manager
 
 	// isLeader tracks whether this pod is the current leader.
-	// Only the leader should update shared K8s resources (Service, Ingress).
+	// Only the leader should clean up shared K8s resources via DisclosePort.
+	// ExposePort is safe from any pod (retry-on-conflict handles concurrent writes).
 	isLeader atomic.Bool
-	// portsExposed tracks whether the leader has exposed ports for the running server.
-	// Reset on leadership loss; used to trigger re-exposure after leadership transfer.
-	portsExposed atomic.Bool
 
 	// serverDone is closed when the server stops, allowing waiters to unblock
 	serverDone     chan struct{}
@@ -224,14 +222,8 @@ func (h *Component) setServerDone(done chan struct{}) {
 func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
 	h.handler = handler
 
-	// Track leader status from context. Only the leader should update shared
-	// K8s resources (Service/Ingress) to avoid concurrent write races.
-	wasLeader := h.isLeader.Load()
-	isNowLeader := moduleutils.IsLeader(ctx)
-	h.isLeader.Store(isNowLeader)
-	if wasLeader && !isNowLeader {
-		h.portsExposed.Store(false)
-	}
+	// Track leader status from context so DisclosePort calls can be guarded.
+	h.isLeader.Store(moduleutils.IsLeader(ctx))
 
 	switch port {
 	case v1alpha1.ReconcilePort:
@@ -325,15 +317,6 @@ func (h *Component) handleReconcile(msg interface{}, handler module.Handler) {
 			log.Info().Msg("http_server: start metadata cleared, stopping running server")
 			_ = h.stop()
 			return
-		}
-		// After leadership transfer, the new leader must re-expose ports for running servers.
-		// The previous leader's exposure is still in the ingress/service, but if pods restarted
-		// simultaneously (e.g. module upgrade), the race condition may have left them incomplete.
-		if h.isLeader.Load() && !h.portsExposed.Load() && h.portMgr != nil {
-			if port := h.getLastExposedPort(); port > 0 {
-				log.Info().Int("port", port).Msg("http_server: leader re-exposing ports for running server")
-				go h.exposePort(context.Background(), port)
-			}
 		}
 		return
 	}
@@ -751,25 +734,18 @@ func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handl
 }
 
 func (h *Component) exposePort(ctx context.Context, port int) []string {
-	log.Info().Int("port", port).Bool("hasPortMgr", h.portMgr != nil).Bool("isLeader", h.isLeader.Load()).Msg("http-server: exposePort called")
+	log.Info().Int("port", port).Bool("hasPortMgr", h.portMgr != nil).Msg("http-server: exposePort called")
 
 	if h.portMgr == nil {
 		log.Error().Int("port", port).Msg("http-server: portMgr is nil, cannot expose port")
 		return []string{fmt.Sprintf("http://localhost:%d", port)}
 	}
 
-	// Only the leader should update shared K8s resources (Service/Ingress).
-	// Reader pods still run the HTTP server locally (for load balancing), but
-	// skip port exposure to avoid concurrent write races on the shared ingress.
-	if !h.isLeader.Load() {
-		log.Info().Int("port", port).Msg("http-server: not leader, skipping port exposure")
-		h.setLastExposedPort(port)
-		return []string{fmt.Sprintf("http://localhost:%d", port)}
-	}
-
-	// Clean up old port if it's different from the new one (e.g., after pod restart)
+	// Clean up old port if it's different from the new one (e.g., after pod restart).
+	// Only leader should disclose — DisclosePort has no retry-on-conflict and can
+	// overwrite another pod's ExposePort work.
 	oldPort := h.getLastExposedPort()
-	if oldPort > 0 && oldPort != port {
+	if h.isLeader.Load() && oldPort > 0 && oldPort != port {
 		log.Info().Int("oldPort", oldPort).Int("newPort", port).Msg("http-server: cleaning up old port before exposing new one")
 		discloseCtx, discloseCancel := context.WithTimeout(ctx, time.Second*30)
 		if err := h.portMgr.DisclosePort(discloseCtx, oldPort); err != nil {
@@ -803,7 +779,6 @@ func (h *Component) exposePort(ctx context.Context, port int) []string {
 
 	// Update last exposed port after successful expose
 	h.setLastExposedPort(port)
-	h.portsExposed.Store(true)
 
 	return publicURLs
 }
