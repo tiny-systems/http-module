@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goccy/go-json"
@@ -64,6 +65,13 @@ type Component struct {
 	handler    module.Handler
 
 	portMgr *portmanager.Manager
+
+	// isLeader tracks whether this pod is the current leader.
+	// Only the leader should update shared K8s resources (Service, Ingress).
+	isLeader atomic.Bool
+	// portsExposed tracks whether the leader has exposed ports for the running server.
+	// Reset on leadership loss; used to trigger re-exposure after leadership transfer.
+	portsExposed atomic.Bool
 
 	// serverDone is closed when the server stops, allowing waiters to unblock
 	serverDone     chan struct{}
@@ -216,6 +224,15 @@ func (h *Component) setServerDone(done chan struct{}) {
 func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
 	h.handler = handler
 
+	// Track leader status from context. Only the leader should update shared
+	// K8s resources (Service/Ingress) to avoid concurrent write races.
+	wasLeader := h.isLeader.Load()
+	isNowLeader := moduleutils.IsLeader(ctx)
+	h.isLeader.Store(isNowLeader)
+	if wasLeader && !isNowLeader {
+		h.portsExposed.Store(false)
+	}
+
 	switch port {
 	case v1alpha1.ReconcilePort:
 		h.handleReconcile(msg, handler)
@@ -307,6 +324,16 @@ func (h *Component) handleReconcile(msg interface{}, handler module.Handler) {
 		if _, ok := h.readStartFromMetadata(node.Status.Metadata); !ok {
 			log.Info().Msg("http_server: start metadata cleared, stopping running server")
 			_ = h.stop()
+			return
+		}
+		// After leadership transfer, the new leader must re-expose ports for running servers.
+		// The previous leader's exposure is still in the ingress/service, but if pods restarted
+		// simultaneously (e.g. module upgrade), the race condition may have left them incomplete.
+		if h.isLeader.Load() && !h.portsExposed.Load() && h.portMgr != nil {
+			if port := h.getLastExposedPort(); port > 0 {
+				log.Info().Int("port", port).Msg("http_server: leader re-exposing ports for running server")
+				go h.exposePort(context.Background(), port)
+			}
 		}
 		return
 	}
@@ -416,10 +443,12 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 			h.stop()
 			h.clearStartMetadata(handler)
 			// Disclose port — this is an intentional stop (ticker cancelled), not a rolling update
-			if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
-				dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				_ = h.portMgr.DisclosePort(dCtx, port)
-				dCancel()
+			if h.isLeader.Load() {
+				if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
+					dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					_ = h.portMgr.DisclosePort(dCtx, port)
+					dCancel()
+				}
 			}
 			return nil
 		}
@@ -448,10 +477,12 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 
 	if ctx.Err() != nil {
 		h.clearStartMetadata(handler)
-		if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
-			dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			_ = h.portMgr.DisclosePort(dCtx, port)
-			dCancel()
+		if h.isLeader.Load() {
+			if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
+				dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_ = h.portMgr.DisclosePort(dCtx, port)
+				dCancel()
+			}
 		}
 	}
 	return err
@@ -720,10 +751,19 @@ func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handl
 }
 
 func (h *Component) exposePort(ctx context.Context, port int) []string {
-	log.Info().Int("port", port).Bool("hasPortMgr", h.portMgr != nil).Msg("http-server: exposePort called")
+	log.Info().Int("port", port).Bool("hasPortMgr", h.portMgr != nil).Bool("isLeader", h.isLeader.Load()).Msg("http-server: exposePort called")
 
 	if h.portMgr == nil {
 		log.Error().Int("port", port).Msg("http-server: portMgr is nil, cannot expose port")
+		return []string{fmt.Sprintf("http://localhost:%d", port)}
+	}
+
+	// Only the leader should update shared K8s resources (Service/Ingress).
+	// Reader pods still run the HTTP server locally (for load balancing), but
+	// skip port exposure to avoid concurrent write races on the shared ingress.
+	if !h.isLeader.Load() {
+		log.Info().Int("port", port).Msg("http-server: not leader, skipping port exposure")
+		h.setLastExposedPort(port)
 		return []string{fmt.Sprintf("http://localhost:%d", port)}
 	}
 
@@ -763,6 +803,7 @@ func (h *Component) exposePort(ctx context.Context, port int) []string {
 
 	// Update last exposed port after successful expose
 	h.setLastExposedPort(port)
+	h.portsExposed.Store(true)
 
 	return publicURLs
 }
@@ -877,6 +918,11 @@ var _ module.Destroyer = (*Component)(nil)
 func (h *Component) OnDestroy(metadata map[string]string) {
 	h.stop()
 	if h.portMgr == nil {
+		return
+	}
+
+	// Only the leader should modify shared K8s resources (Service/Ingress).
+	if !h.isLeader.Load() {
 		return
 	}
 
