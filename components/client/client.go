@@ -42,11 +42,21 @@ type Response struct {
 	Response ResponseResponse `json:"response" title:"Response" required:"true" description:"HTTP Response"`
 }
 
+type TLSInfo struct {
+	NotAfter        string   `json:"notAfter" title:"Not After" description:"Certificate expiry date in RFC3339 format"`
+	NotBefore       string   `json:"notBefore" title:"Not Before" description:"Certificate start date in RFC3339 format"`
+	Issuer          string   `json:"issuer" title:"Issuer"`
+	Subject         string   `json:"subject" title:"Subject"`
+	DNSNames        []string `json:"dnsNames" title:"DNS Names"`
+	DaysUntilExpiry int      `json:"daysUntilExpiry" title:"Days Until Expiry"`
+}
+
 type ResponseResponse struct {
 	Headers    []etc.Header `json:"headers" required:"true" title:"Headers"`
 	Status     string       `json:"status"`
 	StatusCode int          `json:"statusCode"`
 	Body       string       `json:"body" configurable:"false" title:"Body"`
+	TLS        *TLSInfo     `json:"tls,omitempty" title:"TLS" description:"TLS certificate information (HTTPS only)"`
 }
 
 type Error struct {
@@ -139,11 +149,25 @@ func (h *Component) doRequest(ctx context.Context, handler module.Handler, in Re
 		}
 	}
 
+	var tlsInfo *TLSInfo
+	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+		cert := resp.TLS.PeerCertificates[0]
+		tlsInfo = &TLSInfo{
+			NotAfter:        cert.NotAfter.Format(time.RFC3339),
+			NotBefore:       cert.NotBefore.Format(time.RFC3339),
+			Issuer:          cert.Issuer.String(),
+			Subject:         cert.Subject.String(),
+			DNSNames:        cert.DNSNames,
+			DaysUntilExpiry: int(time.Until(cert.NotAfter).Hours() / 24),
+		}
+	}
+
 	respData := ResponseResponse{
 		Body:       body,
 		Headers:    headers,
 		Status:     resp.Status,
 		StatusCode: resp.StatusCode,
+		TLS:        tlsInfo,
 	}
 
 	if resp.StatusCode >= 400 {
