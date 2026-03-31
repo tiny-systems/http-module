@@ -112,6 +112,8 @@ type Start struct {
 	Hostnames    []string     `json:"hostnames,omitempty" title:"Hostnames"  description:"List of virtual host this server should be bound to."`
 	ReadTimeout  int          `json:"readTimeout" required:"true" title:"Read Timeout" description:"Read timeout is the maximum duration for reading the entire request in seconds, including the body. A zero or negative value means there will be no timeout."`
 	WriteTimeout int          `json:"writeTimeout" required:"true" title:"Write Timeout" description:"Write timeout is the maximum duration before timing out writes of the response in seconds. It is reset whenever a new request's header is read."`
+	TLSCert      string       `json:"tlsCert,omitempty" title:"TLS Certificate" description:"PEM-encoded certificate for HTTPS. Leave empty for plain HTTP." format:"textarea"`
+	TLSKey       string       `json:"tlsKey,omitempty" title:"TLS Private Key" description:"PEM-encoded private key for HTTPS. Leave empty for plain HTTP." format:"textarea"`
 }
 
 type Request struct {
@@ -698,12 +700,56 @@ func (h *Component) determineListenAddr() string {
 }
 
 func (h *Component) startEchoServer(e *echo.Echo, addr string, cancel context.CancelFunc) {
-	err := e.Start(addr)
+	var err error
+	if h.startSettings.TLSCert != "" && h.startSettings.TLSKey != "" {
+		certFile, keyFile, cleanup, writeErr := writeTLSFiles(h.startSettings.TLSCert, h.startSettings.TLSKey)
+		if writeErr != nil {
+			log.Error().Err(writeErr).Msg("failed to write TLS files")
+			cancel()
+			return
+		}
+		defer cleanup()
+		log.Info().Str("addr", addr).Msg("starting HTTPS server")
+		err = e.StartTLS(addr, certFile, keyFile)
+	} else {
+		err = e.Start(addr)
+	}
 	if err == nil || errors.Is(err, http.ErrServerClosed) {
 		return
 	}
 	log.Error().Err(err).Str("addr", addr).Msg("failed to start HTTP server")
 	cancel()
+}
+
+func writeTLSFiles(certPEM, keyPEM string) (certFile, keyFile string, cleanup func(), err error) {
+	cf, err := os.CreateTemp("", "tls-cert-*.pem")
+	if err != nil {
+		return "", "", nil, fmt.Errorf("create cert temp file: %w", err)
+	}
+	if _, err := cf.WriteString(certPEM); err != nil {
+		cf.Close()
+		os.Remove(cf.Name())
+		return "", "", nil, fmt.Errorf("write cert: %w", err)
+	}
+	cf.Close()
+
+	kf, err := os.CreateTemp("", "tls-key-*.pem")
+	if err != nil {
+		os.Remove(cf.Name())
+		return "", "", nil, fmt.Errorf("create key temp file: %w", err)
+	}
+	if _, err := kf.WriteString(keyPEM); err != nil {
+		kf.Close()
+		os.Remove(cf.Name())
+		os.Remove(kf.Name())
+		return "", "", nil, fmt.Errorf("write key: %w", err)
+	}
+	kf.Close()
+
+	return cf.Name(), kf.Name(), func() {
+		os.Remove(cf.Name())
+		os.Remove(kf.Name())
+	}, nil
 }
 
 func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handler module.Handler) (int, error) {
