@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -112,8 +113,8 @@ type Start struct {
 	Hostnames    []string     `json:"hostnames,omitempty" title:"Hostnames"  description:"List of virtual host this server should be bound to."`
 	ReadTimeout  int          `json:"readTimeout" required:"true" title:"Read Timeout" description:"Read timeout is the maximum duration for reading the entire request in seconds, including the body. A zero or negative value means there will be no timeout."`
 	WriteTimeout int          `json:"writeTimeout" required:"true" title:"Write Timeout" description:"Write timeout is the maximum duration before timing out writes of the response in seconds. It is reset whenever a new request's header is read."`
-	TLSCert      string       `json:"tlsCert,omitempty" title:"TLS Certificate" description:"PEM-encoded certificate for HTTPS. Leave empty for plain HTTP." format:"textarea"`
-	TLSKey       string       `json:"tlsKey,omitempty" title:"TLS Private Key" description:"PEM-encoded private key for HTTPS. Leave empty for plain HTTP." format:"textarea"`
+	TLSCert      string       `json:"tlsCert,omitempty" title:"TLS Certificate" description:"PEM or base64-encoded PEM certificate for HTTPS. Leave empty for plain HTTP." format:"textarea"`
+	TLSKey       string       `json:"tlsKey,omitempty" title:"TLS Private Key" description:"PEM or base64-encoded PEM private key for HTTPS. Leave empty for plain HTTP." format:"textarea"`
 }
 
 type Request struct {
@@ -702,7 +703,9 @@ func (h *Component) determineListenAddr() string {
 func (h *Component) startEchoServer(e *echo.Echo, addr string, cancel context.CancelFunc) {
 	var err error
 	if h.startSettings.TLSCert != "" && h.startSettings.TLSKey != "" {
-		certFile, keyFile, cleanup, writeErr := writeTLSFiles(h.startSettings.TLSCert, h.startSettings.TLSKey)
+		certPEM := decodePEM(h.startSettings.TLSCert)
+		keyPEM := decodePEM(h.startSettings.TLSKey)
+		certFile, keyFile, cleanup, writeErr := writeTLSFiles(certPEM, keyPEM)
 		if writeErr != nil {
 			log.Error().Err(writeErr).Msg("failed to write TLS files")
 			cancel()
@@ -750,6 +753,20 @@ func writeTLSFiles(certPEM, keyPEM string) (certFile, keyFile string, cleanup fu
 		os.Remove(cf.Name())
 		os.Remove(kf.Name())
 	}, nil
+}
+
+// decodePEM returns PEM content. If the input doesn't look like PEM,
+// it tries base64 decoding first. This allows passing certs as base64
+// strings through edge configs without newline issues.
+func decodePEM(s string) string {
+	if strings.HasPrefix(strings.TrimSpace(s), "-----BEGIN") {
+		return s
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
+	if err != nil {
+		return s
+	}
+	return string(decoded)
 }
 
 func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handler module.Handler) (int, error) {
