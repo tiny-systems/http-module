@@ -545,8 +545,9 @@ func (h *Component) runServer(ctx context.Context, handler module.Handler) error
 	go h.startEchoServer(e, listenAddr, serverCancel)
 
 	// Poll for Echo to bind its listener instead of fixed sleep
+	// Check both Listener (plain HTTP) and TLSListener (HTTPS)
 	deadline := time.Now().Add(5 * time.Second)
-	for e.Listener == nil && time.Now().Before(deadline) {
+	for e.Listener == nil && e.TLSListener == nil && time.Now().Before(deadline) {
 		select {
 		case <-serverCtx.Done():
 			return serverCtx.Err()
@@ -770,13 +771,18 @@ func decodePEM(s string) string {
 }
 
 func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handler module.Handler) (int, error) {
-	if e.Listener == nil {
+	// Use TLSListener for HTTPS, Listener for plain HTTP
+	listener := e.Listener
+	if listener == nil {
+		listener = e.TLSListener
+	}
+	if listener == nil {
 		log.Error().Msg("HTTP server failed to bind - listener is nil")
 		h.setListenPort(0)
 		return 0, fmt.Errorf("server failed to bind")
 	}
 
-	tcpAddr, ok := e.Listener.Addr().(*net.TCPAddr)
+	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	if !ok {
 		return 0, nil
 	}
