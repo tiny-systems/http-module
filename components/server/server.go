@@ -41,6 +41,8 @@ const (
 )
 
 type Component struct {
+	module.Base
+
 	settings     Settings
 	settingsLock *sync.Mutex
 
@@ -63,7 +65,6 @@ type Component struct {
 
 	nodeName   string
 	sourceNode string
-	handler    module.Handler
 
 	portMgr *portmanager.Manager
 
@@ -220,46 +221,18 @@ func (h *Component) setServerDone(done chan struct{}) {
 	h.serverDone = done
 }
 
-// Handle dispatches to port-specific handlers
-
-func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
-	h.handler = handler
-
-	// Track leader status from context so DisclosePort calls can be guarded.
-	h.isLeader.Store(moduleutils.IsLeader(ctx))
-
-	switch port {
-	case v1alpha1.ReconcilePort:
-		h.handleReconcile(msg, handler)
-		return nil
-	case v1alpha1.ClientPort:
-		return h.handleClient(msg)
-	case v1alpha1.SettingsPort:
-		return h.handleSettings(msg)
-	case StartPort:
-		return h.handleStart(ctx, handler, msg)
-	case ResponsePort:
-		return h.handleResponse(msg)
-	default:
-		return fmt.Errorf("port %s is not supported", port)
+// OnClient receives the K8s client and initializes the port manager.
+func (h *Component) OnClient(k8sClient module.K8sClient) {
+	if k8sClient == nil {
+		log.Warn().Msg("http-server: OnClient received nil client")
+		return
 	}
+	h.portMgr = portmanager.New(k8sClient.GetK8sClient(), k8sClient.GetNamespace())
+	log.Info().Str("namespace", k8sClient.GetNamespace()).Msg("http-server: portMgr initialized")
 }
 
-func (h *Component) handleClient(msg interface{}) error {
-	log.Info().Str("msgType", fmt.Sprintf("%T", msg)).Msg("http-server: handleClient called")
-
-	k8sProvider, ok := msg.(module.K8sClient)
-	if !ok {
-		log.Warn().Str("msgType", fmt.Sprintf("%T", msg)).Msg("http-server: msg does not implement K8sClient")
-		return nil
-	}
-
-	h.portMgr = portmanager.New(k8sProvider.GetK8sClient(), k8sProvider.GetNamespace())
-	log.Info().Str("namespace", k8sProvider.GetNamespace()).Msg("http-server: portMgr initialized")
-	return nil
-}
-
-func (h *Component) handleSettings(msg interface{}) error {
+// OnSettings receives Settings.
+func (h *Component) OnSettings(_ context.Context, msg any) error {
 	in, ok := msg.(Settings)
 	if !ok {
 		return fmt.Errorf("invalid settings message")
@@ -268,6 +241,32 @@ func (h *Component) handleSettings(msg interface{}) error {
 	defer h.settingsLock.Unlock()
 	h.settings = in
 	return nil
+}
+
+// OnReconcile updates leader status from context, restores running state
+// from metadata, and starts (or stops) the server accordingly.
+func (h *Component) OnReconcile(ctx context.Context, node v1alpha1.TinyNode) error {
+	h.isLeader.Store(moduleutils.IsLeader(ctx))
+	h.handleReconcile(node)
+	return nil
+}
+
+// Handle dispatches business ports (Start, Response). System ports go
+// through the capability methods above.
+func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
+	// Refresh leader status on every business port call too — control
+	// messages from the dashboard come via Handle paths and may carry
+	// updated leader context.
+	h.isLeader.Store(moduleutils.IsLeader(ctx))
+
+	switch port {
+	case StartPort:
+		return h.handleStart(ctx, handler, msg)
+	case ResponsePort:
+		return h.handleResponse(msg)
+	default:
+		return fmt.Errorf("port %s is not supported", port)
+	}
 }
 
 func (h *Component) handleResponse(msg interface{}) any {
@@ -297,12 +296,7 @@ func (h *Component) handleResponse(msg interface{}) any {
 	return in
 }
 
-func (h *Component) handleReconcile(msg interface{}, handler module.Handler) {
-	node, ok := msg.(v1alpha1.TinyNode)
-	if !ok {
-		return
-	}
-
+func (h *Component) handleReconcile(node v1alpha1.TinyNode) {
 	h.nodeName = node.Name
 
 	if node.Status.Metadata == nil {
@@ -332,7 +326,7 @@ func (h *Component) handleReconcile(msg interface{}, handler module.Handler) {
 	h.startSettings = startCfg
 	log.Info().Interface("start", startCfg).Int("port", metadataPort).Msg("http_server: restoring from metadata")
 
-	go h.startFromMetadata(handler, metadataPort)
+	go h.startFromMetadata(metadataPort)
 }
 
 func (h *Component) readPortFromMetadata(metadata map[string]string) int {
@@ -381,7 +375,7 @@ func (h *Component) readStartFromMetadata(metadata map[string]string) (Start, bo
 	return cfg, true
 }
 
-func (h *Component) startFromMetadata(handler module.Handler, port int) {
+func (h *Component) startFromMetadata(port int) {
 	h.startStopLock.Lock()
 	defer h.startStopLock.Unlock()
 
@@ -390,13 +384,13 @@ func (h *Component) startFromMetadata(handler module.Handler, port int) {
 	}
 
 	log.Info().Int("port", port).Msg("http_server: starting server from metadata")
-	if err := h.runServer(context.Background(), handler); err != nil {
+	if err := h.runServer(context.Background(), h.Emitter()); err != nil {
 		log.Error().Err(err).Msg("http_server: server stopped after metadata restoration")
 	}
 
 	// Push updated status so UI shows "Not running"
-	_ = handler(context.Background(), v1alpha1.ControlPort, h.getControl())
-	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
+	_ = h.Emit(context.Background(), v1alpha1.ControlPort, h.getControl())
+	_ = h.Emit(context.Background(), v1alpha1.ReconcilePort, nil)
 }
 
 func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg interface{}) error {
@@ -417,7 +411,7 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 		Bool("isRunning", h.isRunning()).
 		Msg("http_server: StartPort received")
 
-	h.persistStartConfig(handler, in)
+	h.persistStartConfig(in)
 
 	if done := h.getServerDone(); done != nil {
 		log.Info().Msg("http_server: already running, waiting for server to stop")
@@ -427,7 +421,7 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 			return nil
 		case <-ctx.Done():
 			h.stop()
-			h.clearStartMetadata(handler)
+			h.clearStartMetadata()
 			// Disclose port — this is an intentional stop (ticker cancelled), not a rolling update
 			if h.isLeader.Load() {
 				if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
@@ -459,10 +453,10 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 	err := h.runServer(ctx, handler)
 
 	log.Info().Err(err).Msg("http_server: server stopped")
-	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
+	_ = h.Emit(context.Background(), v1alpha1.ReconcilePort, nil)
 
 	if ctx.Err() != nil {
-		h.clearStartMetadata(handler)
+		h.clearStartMetadata()
 		if h.isLeader.Load() {
 			if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
 				dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -484,9 +478,9 @@ func (h *Component) parseStartConfig(msg interface{}) Start {
 	return in
 }
 
-func (h *Component) persistStartConfig(handler module.Handler, cfg Start) {
+func (h *Component) persistStartConfig(cfg Start) {
 	startBytes, _ := json.Marshal(cfg)
-	_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+	_ = h.Emit(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
 		if n.Status.Metadata == nil {
 			n.Status.Metadata = make(map[string]string)
 		}
@@ -495,8 +489,8 @@ func (h *Component) persistStartConfig(handler module.Handler, cfg Start) {
 	})
 }
 
-func (h *Component) clearStartMetadata(handler module.Handler) {
-	_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+func (h *Component) clearStartMetadata() {
+	_ = h.Emit(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
 		if n.Status.Metadata == nil {
 			return nil
 		}
@@ -770,7 +764,7 @@ func decodePEM(s string) string {
 	return string(decoded)
 }
 
-func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handler module.Handler) (int, error) {
+func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, _ module.Handler) (int, error) {
 	// Use TLSListener for HTTPS, Listener for plain HTTP
 	listener := e.Listener
 	if listener == nil {
@@ -796,8 +790,8 @@ func (h *Component) handleServerStarted(ctx context.Context, e *echo.Echo, handl
 	publicURLs := h.exposePort(ctx, tcpAddr.Port)
 	h.setPublicListenAddr(publicURLs)
 
-	h.persistPort(handler, actualPort)
-	_ = handler(context.Background(), v1alpha1.ReconcilePort, nil)
+	h.persistPort(actualPort)
+	_ = h.Emit(context.Background(), v1alpha1.ReconcilePort, nil)
 
 	return actualPort, nil
 }
@@ -852,8 +846,8 @@ func (h *Component) exposePort(ctx context.Context, port int) []string {
 	return publicURLs
 }
 
-func (h *Component) persistPort(handler module.Handler, port int) {
-	_ = handler(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
+func (h *Component) persistPort(port int) {
+	_ = h.Emit(context.Background(), v1alpha1.ReconcilePort, func(n *v1alpha1.TinyNode) error {
 		if n.Status.Metadata == nil {
 			n.Status.Metadata = make(map[string]string)
 		}
@@ -954,8 +948,13 @@ func (h *Component) Ports() []module.Port {
 	return ports
 }
 
-var _ module.Component = (*Component)(nil)
-var _ module.Destroyer = (*Component)(nil)
+var (
+	_ module.Component        = (*Component)(nil)
+	_ module.SettingsHandler  = (*Component)(nil)
+	_ module.ReconcileHandler = (*Component)(nil)
+	_ module.ClientAware      = (*Component)(nil)
+	_ module.Destroyer        = (*Component)(nil)
+)
 
 // OnDestroy implements module.Destroyer interface.
 // Called when the node is being deleted (via finalizer) to clean up exposed ports.

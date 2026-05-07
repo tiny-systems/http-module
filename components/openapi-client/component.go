@@ -139,52 +139,51 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	}
 }
 
-func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
-
-	switch port {
-	case v1alpha1.SettingsPort:
-		in, ok := msg.(Settings)
-		if !ok {
-			return fmt.Errorf("invalid settings")
-		}
-
-		err := h.discover(ctx, in)
-
-		//
-		h.settings.OperationName.Value = in.OperationName.Value
-		h.settings.OperationName.Options = h.allOperations
-		h.settings.OperationName.OptionLabels = h.allOperationsDescriptions
-
-		h.settings.EnabledResponses.Value = filterStringsByAppearance(in.EnabledResponses.Value, h.allResponsesCodes)
-		h.settings.EnabledResponses.Options = h.allResponsesCodes
-		h.settings.EnabledResponses.OptionLabels = h.allResponsesDescriptions
-
-		return err
-
-	case RequestPort:
-		in, ok := msg.(Request)
-		if !ok {
-			return fmt.Errorf("invalid input")
-		}
-
-		_, err := h.invoke(ctx, in.Request)
-		if err != nil {
-			if !h.settings.EnableErrorPort {
-				return err
-			}
-			return handler(ctx, ErrorPort, Error{
-				Context: in.Context,
-				Error:   err.Error(),
-			})
-		}
-		return handler(ctx, ResponsePort, Response{
-			Response: ResponseMsg{},
-			Context:  in.Context,
-		})
-
-	default:
-		return fmt.Errorf("port %s is not supoprted", port)
+// OnSettings receives Settings, parses the OpenAPI spec, and updates
+// the operations / response code enums.
+func (h *Component) OnSettings(ctx context.Context, msg any) error {
+	in, ok := msg.(Settings)
+	if !ok {
+		return fmt.Errorf("invalid settings")
 	}
+
+	err := h.discover(ctx, in)
+
+	h.settings.OperationName.Value = in.OperationName.Value
+	h.settings.OperationName.Options = h.allOperations
+	h.settings.OperationName.OptionLabels = h.allOperationsDescriptions
+
+	h.settings.EnabledResponses.Value = filterStringsByAppearance(in.EnabledResponses.Value, h.allResponsesCodes)
+	h.settings.EnabledResponses.Options = h.allResponsesCodes
+	h.settings.EnabledResponses.OptionLabels = h.allResponsesDescriptions
+
+	return err
+}
+
+// Handle dispatches RequestPort. System ports go through capabilities.
+func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
+	if port != RequestPort {
+		return fmt.Errorf("port %s is not supported", port)
+	}
+	in, ok := msg.(Request)
+	if !ok {
+		return fmt.Errorf("invalid input")
+	}
+
+	_, err := h.invoke(ctx, in.Request)
+	if err != nil {
+		if !h.settings.EnableErrorPort {
+			return err
+		}
+		return handler(ctx, ErrorPort, Error{
+			Context: in.Context,
+			Error:   err.Error(),
+		})
+	}
+	return handler(ctx, ResponsePort, Response{
+		Response: ResponseMsg{},
+		Context:  in.Context,
+	})
 }
 
 func (h *Component) invoke(ctx context.Context, msg any) ([]byte, error) {
@@ -427,7 +426,10 @@ var _ jsonschema.Exposer = (*ResponseMsg)(nil)
 //var _ json.Marshaler = (*RequestMsg)(nil)
 //var _ json.Unmarshaler = (*RequestMsg)(nil)
 
-var _ module.Component = (*Component)(nil)
+var (
+	_ module.Component       = (*Component)(nil)
+	_ module.SettingsHandler = (*Component)(nil)
+)
 
 func init() {
 	registry.Register(&Component{})

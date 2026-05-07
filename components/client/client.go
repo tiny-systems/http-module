@@ -84,29 +84,26 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	}
 }
 
-func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
-
-	switch port {
-	case v1alpha1.SettingsPort:
-		// compile template
-		in, ok := msg.(Settings)
-		if !ok {
-			return fmt.Errorf("invalid settings")
-		}
-		h.settings = in
-
-		return nil
-
-	case RequestPort:
-		in, ok := msg.(Request)
-		if !ok {
-			return fmt.Errorf("invalid message")
-		}
-		return h.doRequest(ctx, handler, in)
-
-	default:
-		return fmt.Errorf("port %s is not supoprted", port)
+// OnSettings receives Settings from the SettingsPort.
+func (h *Component) OnSettings(_ context.Context, msg any) error {
+	in, ok := msg.(Settings)
+	if !ok {
+		return fmt.Errorf("invalid settings")
 	}
+	h.settings = in
+	return nil
+}
+
+// Handle dispatches the RequestPort. System ports go through capabilities.
+func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
+	if port != RequestPort {
+		return fmt.Errorf("port %s is not supported", port)
+	}
+	in, ok := msg.(Request)
+	if !ok {
+		return fmt.Errorf("invalid message")
+	}
+	return h.doRequest(ctx, handler, in)
 }
 
 func (h *Component) doRequest(ctx context.Context, handler module.Handler, in Request) any {
@@ -234,7 +231,10 @@ func (h *Component) Ports() []module.Port {
 	})
 }
 
-var _ module.Component = (*Component)(nil)
+var (
+	_ module.Component       = (*Component)(nil)
+	_ module.SettingsHandler = (*Component)(nil)
+)
 
 func init() {
 	registry.Register((&Component{}).Instance())
