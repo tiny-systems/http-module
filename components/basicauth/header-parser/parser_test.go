@@ -3,9 +3,10 @@ package echo
 import (
 	"context"
 	"fmt"
+	"testing"
+
 	"github.com/tiny-systems/http-module/components/etc"
 	"github.com/tiny-systems/module/module"
-	"testing"
 )
 
 func TestComponent_Handle(t1 *testing.T) {
@@ -27,9 +28,9 @@ func TestComponent_Handle(t1 *testing.T) {
 				ctx:  context.Background(),
 				port: "",
 				msg:  OutMessage{},
-				handler: func(ctx context.Context, port string, data interface{}) any {
+				handler: func(ctx context.Context, port string, data interface{}) module.Result {
 					t1.Errorf("handler err")
-					return nil
+					return module.Result{}
 				},
 			},
 		},
@@ -39,12 +40,12 @@ func TestComponent_Handle(t1 *testing.T) {
 				ctx:  context.Background(),
 				port: "",
 				msg:  InMessage{},
-				handler: func(ctx context.Context, port string, data interface{}) any {
+				handler: func(ctx context.Context, port string, data interface{}) module.Result {
 					msg := data.(OutMessage)
 					if msg.Found {
-						return fmt.Errorf("should not found")
+						return module.Fail(fmt.Errorf("should not found"))
 					}
-					return nil
+					return module.Result{}
 				},
 			},
 		},
@@ -60,12 +61,12 @@ func TestComponent_Handle(t1 *testing.T) {
 						Value: "s",
 					},
 				},
-				handler: func(ctx context.Context, port string, data interface{}) any {
+				handler: func(ctx context.Context, port string, data interface{}) module.Result {
 					msg := data.(OutMessage)
 					if msg.Found {
-						return fmt.Errorf("should not found")
+						return module.Fail(fmt.Errorf("should not found"))
 					}
-					return nil
+					return module.Result{}
 				},
 			},
 		},
@@ -83,21 +84,21 @@ func TestComponent_Handle(t1 *testing.T) {
 						},
 					},
 				},
-				handler: func(ctx context.Context, _ string, data interface{}) any {
+				handler: func(ctx context.Context, _ string, data interface{}) module.Result {
 					msg, ok := data.(OutMessage)
 					if !ok {
-						return fmt.Errorf("invalid type")
+						return module.Fail(fmt.Errorf("invalid type"))
 					}
 					if !msg.Found {
-						return fmt.Errorf("should found")
+						return module.Fail(fmt.Errorf("should found"))
 					}
 					if msg.User != "username1" {
-						return fmt.Errorf("invalid user")
+						return module.Fail(fmt.Errorf("invalid user"))
 					}
 					if msg.Password != "password2" {
-						return fmt.Errorf("invalid password")
+						return module.Fail(fmt.Errorf("invalid password"))
 					}
-					return nil
+					return module.Result{}
 				},
 			},
 		},
@@ -115,21 +116,21 @@ func TestComponent_Handle(t1 *testing.T) {
 						},
 					},
 				},
-				handler: func(ctx context.Context, _ string, data interface{}) any {
+				handler: func(ctx context.Context, _ string, data interface{}) module.Result {
 					msg, ok := data.(OutMessage)
 					if !ok {
-						return fmt.Errorf("invalid type")
+						return module.Fail(fmt.Errorf("invalid type"))
 					}
 					if !msg.Found {
-						return fmt.Errorf("should found")
+						return module.Fail(fmt.Errorf("should found"))
 					}
 					if msg.User != "username1" {
-						return fmt.Errorf("invalid user")
+						return module.Fail(fmt.Errorf("invalid user"))
 					}
 					if msg.Password != "password1" {
-						return fmt.Errorf("invalid password")
+						return module.Fail(fmt.Errorf("invalid password"))
 					}
-					return nil
+					return module.Result{}
 				},
 			},
 		},
@@ -137,8 +138,9 @@ func TestComponent_Handle(t1 *testing.T) {
 	for _, tt := range tests {
 		t1.Run(tt.name, func(t1 *testing.T) {
 			t := &Component{}
-			if err := t.Handle(tt.args.ctx, tt.args.handler, tt.args.port, tt.args.msg); (err != nil) != tt.wantErr {
-				t1.Errorf("Handle() error = %v, wantErr %v", err, tt.wantErr)
+			r := t.Handle(tt.args.ctx, tt.args.handler, tt.args.port, tt.args.msg)
+			if (r.Err() != nil) != tt.wantErr {
+				t1.Errorf("Handle() error = %v, wantErr %v", r.Err(), tt.wantErr)
 			}
 		})
 	}
