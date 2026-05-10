@@ -253,7 +253,7 @@ func (h *Component) OnReconcile(ctx context.Context, node v1alpha1.TinyNode) err
 
 // Handle dispatches business ports (Start, Response). System ports go
 // through the capability methods above.
-func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
+func (h *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) module.Result {
 	// Refresh leader status on every business port call too — control
 	// messages from the dashboard come via Handle paths and may carry
 	// updated leader context.
@@ -261,15 +261,18 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 
 	switch port {
 	case StartPort:
-		return h.handleStart(ctx, handler, msg)
+		if err := h.handleStart(ctx, handler, msg); err != nil {
+			return module.Fail(err)
+		}
+		return module.Result{}
 	case ResponsePort:
 		return h.handleResponse(msg)
 	default:
-		return fmt.Errorf("port %s is not supported", port)
+		return module.Fail(fmt.Errorf("port %s is not supported", port))
 	}
 }
 
-func (h *Component) handleResponse(msg interface{}) any {
+func (h *Component) handleResponse(msg interface{}) module.Result {
 	log.Info().
 		Str("type", fmt.Sprintf("%T", msg)).
 		Bool("isNil", msg == nil).
@@ -281,7 +284,7 @@ func (h *Component) handleResponse(msg interface{}) any {
 			Interface("msg", msg).
 			Str("type", fmt.Sprintf("%T", msg)).
 			Msg("http_server: handleResponse - msg is not Response type")
-		return fmt.Errorf("invalid response message: got %T", msg)
+		return module.Fail(fmt.Errorf("invalid response message: got %T", msg))
 	}
 
 	if in.StatusCode == 0 && in.Body == "" && in.ContentType == "" {
@@ -293,7 +296,7 @@ func (h *Component) handleResponse(msg interface{}) any {
 		Int("bodyLen", len(in.Body)).
 		Msg("http_server: handleResponse returning")
 
-	return in
+	return module.Ok(in)
 }
 
 func (h *Component) handleReconcile(node v1alpha1.TinyNode) {
@@ -582,24 +585,25 @@ func (h *Component) handleHTTPRequest(c echo.Context, handler module.Handler) er
 	log.Info().Str("uri", req.RequestURI).Str("method", req.Method).Msg("http_server: handling request")
 
 	resp := handler(c.Request().Context(), RequestPort, req)
+	respValue := resp.Value()
 
 	log.Info().
-		Str("type", fmt.Sprintf("%T", resp)).
-		Bool("isNil", resp == nil).
+		Str("type", fmt.Sprintf("%T", respValue)).
+		Bool("isNil", respValue == nil).
 		Msg("http_server: handler returned")
 
-	if err := moduleutils.CheckForError(resp); err != nil {
+	if err := resp.Err(); err != nil {
 		log.Error().Err(err).Msg("http_server: handler returned error")
 		return err
 	}
 
-	respObj, ok := resp.(Response)
+	respObj, ok := respValue.(Response)
 	if !ok {
 		log.Error().
-			Interface("resp", resp).
-			Str("type", fmt.Sprintf("%T", resp)).
+			Interface("resp", respValue).
+			Str("type", fmt.Sprintf("%T", respValue)).
 			Msg("http_server: response is not Response type")
-		return fmt.Errorf("invalid response: got %T", resp)
+		return fmt.Errorf("invalid response: got %T", respValue)
 	}
 
 	if respObj.StatusCode == 0 && respObj.Body == "" && respObj.ContentType == "" {

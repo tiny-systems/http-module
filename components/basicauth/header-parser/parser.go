@@ -46,10 +46,10 @@ func (t *Component) GetInfo() module.ComponentInfo {
 	}
 }
 
-func (t *Component) Handle(ctx context.Context, handler module.Handler, _ string, msg interface{}) any {
+func (t *Component) Handle(ctx context.Context, handler module.Handler, _ string, msg interface{}) module.Result {
 	in, ok := msg.(InMessage)
 	if !ok {
-		return fmt.Errorf("msg type not inMessage")
+		return module.Fail(fmt.Errorf("msg type not inMessage"))
 	}
 
 	for _, h := range in.Headers {
