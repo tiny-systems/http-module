@@ -153,7 +153,7 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "HTTP Server",
-		Info:        "HTTP request handler. Start port receives configuration and starts the server (blocks until stopped). Each incoming HTTP request emits on Request port. Wire Request to processing logic, then wire result to Response port with statusCode, contentType, headers, body.",
+		Info:        "HTTP request handler. The server does NOT run until a message arrives on the Start port — wire a signal (or cron) into Start to launch it (a cron would re-launch on every tick, so prefer signal for a long-running server). On start it exposes a public URL; read that URL from the _control port's ListenAddr (or enable the status port) — never guess the address. Each incoming HTTP request emits on Request port. Wire Request to processing logic, then wire result to Response port with statusCode (required), contentType (required), headers, body.",
 		Tags:        []string{"HTTP", "Server"},
 	}
 }
@@ -423,16 +423,12 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 			log.Info().Msg("http_server: server stopped, returning from Start")
 			return nil
 		case <-ctx.Done():
-			h.stop()
-			h.clearStartMetadata()
-			// Disclose port — this is an intentional stop (ticker cancelled), not a rolling update
-			if h.isLeader.Load() {
-				if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
-					dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
-					_ = h.portMgr.DisclosePort(dCtx, port)
-					dCancel()
-				}
-			}
+			// A duplicate Start's context expired — a transport timeout, NOT
+			// an intent to stop. The running server is owned by reconcile
+			// (started on context.Background()); tearing it down + clearing
+			// metadata here is the pre-JetStream bug that let a 1s ticker
+			// churn the listener into oblivion. Leave the running server up.
+			// Only an explicit stop (nil Start) or OnDestroy may tear it down.
 			return nil
 		}
 	}
@@ -458,16 +454,13 @@ func (h *Component) handleStart(ctx context.Context, handler module.Handler, msg
 	log.Info().Err(err).Msg("http_server: server stopped")
 	_ = h.Emit(context.Background(), v1alpha1.ReconcilePort, nil)
 
-	if ctx.Err() != nil {
-		h.clearStartMetadata()
-		if h.isLeader.Load() {
-			if port := h.getLastExposedPort(); port > 0 && h.portMgr != nil {
-				dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				_ = h.portMgr.DisclosePort(dCtx, port)
-				dCancel()
-			}
-		}
-	}
+	// Deliberately do NOT clear start metadata or disclose the port when
+	// runServer returns due to context cancellation. A cancelled signal/
+	// transport context is a timeout, not an intent to stop. Leaving the
+	// metadata intact lets _reconcile re-host the server on
+	// context.Background() (the durable keep-alive path), so a SINGLE Start
+	// holds the listener forever with no ticker. Metadata is cleared only on
+	// an explicit stop (nil Start, above) or OnDestroy.
 	return err
 }
 
