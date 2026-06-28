@@ -73,11 +73,6 @@ type Component struct {
 	// ExposePort is safe from any pod (retry-on-conflict handles concurrent writes).
 	isLeader atomic.Bool
 
-	// reasserting guards the level-triggered re-disclose goroutine so a burst of
-	// reconciles can't pile up concurrent ExposePort calls. Only one re-assert
-	// runs at a time; reconciles arriving while one is in flight are skipped.
-	reasserting atomic.Bool
-
 	// serverDone is closed when the server stops, allowing waiters to unblock
 	serverDone     chan struct{}
 	serverDoneLock *sync.Mutex
@@ -323,24 +318,10 @@ func (h *Component) handleReconcile(node v1alpha1.TinyNode) {
 			_ = h.stop()
 			return
 		}
-
-		// Level-triggered re-disclose. The listener is up, but the shared manager
-		// Service/Ingress can be reset out from under us WITHOUT restarting this
-		// pod: a same-version module re-install runs `helm upgrade`, which
-		// replaces the Service back to grpc-only and wipes our exposed port.
-		// Nothing re-binds (the listener is fine), so the site goes 503 silently
-		// until something restarts the pod. Re-assert the disclosure on every
-		// reconcile so a wiped Service/Ingress self-heals within one cycle.
-		// ExposePort is idempotent — a no-op read when the port + rule already
-		// exist — so this costs nothing in the healthy case. Leader-only because
-		// it mutates shared cluster resources; the guard keeps reconcile storms
-		// from spawning overlapping goroutines.
-		if h.isLeader.Load() && h.reasserting.CompareAndSwap(false, true) {
-			go func(port int) {
-				defer h.reasserting.Store(false)
-				h.exposePort(context.Background(), port)
-			}(metadataPort)
-		}
+		// Port re-assertion while running is handled by periodicReassert, not
+		// here: an idle running server receives no TinyNode reconciles, and an
+		// external Service reset fires no node event — so reconcile is the wrong
+		// trigger for self-heal. See periodicReassert.
 		return
 	}
 
@@ -572,6 +553,10 @@ func (h *Component) runServer(ctx context.Context, handler module.Handler) error
 	if err != nil {
 		return err
 	}
+
+	// Keep the shared Service/Ingress in sync with the listener for as long as
+	// it runs. Tied to serverCtx so it stops when the server does.
+	go h.periodicReassert(serverCtx, actualPort)
 
 	log.Info().Msg("http-server: waiting on serverCtx.Done()")
 	<-serverCtx.Done()
@@ -864,6 +849,38 @@ func (h *Component) exposePort(ctx context.Context, port int) []string {
 	h.setLastExposedPort(port)
 
 	return publicURLs
+}
+
+// reassertInterval is how often a running server re-asserts its exposed port on
+// the shared Service/Ingress.
+const reassertInterval = 15 * time.Second
+
+// periodicReassert re-asserts the exposed port on a timer for as long as the
+// server runs. It exists because nothing else reliably triggers re-disclosure
+// after an external reset: an idle running server receives no TinyNode
+// reconciles, and a same-version `helm upgrade` that replaces the shared
+// manager Service (wiping our port back to grpc-only) fires no node event and
+// does not restart this pod. Without this, the listener keeps running but
+// becomes unreachable and the site 503s until someone restarts the pod by hand.
+//
+// ExposePort is idempotent — a no-op read when the port + ingress rule already
+// exist — so the healthy case costs only a couple of API reads per interval and
+// never churns the Service or Ingress. Not leader-gated: this only ever ADDs
+// (ExposePort is conflict-safe by design), and the pod re-asserting is the one
+// that actually holds the listener, which is exactly the pod the Service must
+// route to.
+func (h *Component) periodicReassert(ctx context.Context, port int) {
+	ticker := time.NewTicker(reassertInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.exposePort(ctx, port)
+		}
+	}
 }
 
 func (h *Component) persistPort(port int) {
