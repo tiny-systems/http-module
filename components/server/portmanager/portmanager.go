@@ -260,6 +260,23 @@ func (m *Manager) discloseServicePort(ctx context.Context, svc *v1core.Service, 
 	return m.client.Update(ctx, svc)
 }
 
+// ruleHasBackend reports whether an ingress rule already routes to the given
+// service+port over an HTTP path, so a re-assert can skip a no-op Update.
+func ruleHasBackend(rv v1ingress.IngressRuleValue, svcName string, port int32) bool {
+	if rv.HTTP == nil {
+		return false
+	}
+	for _, p := range rv.HTTP.Paths {
+		if p.Backend.Service == nil {
+			continue
+		}
+		if p.Backend.Service.Name == svcName && p.Backend.Service.Port.Number == port {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) addRulesIngress(ctx context.Context, ingress *v1ingress.Ingress, service *v1core.Service, hostnames []string, port int) ([]string, error) {
 	if len(hostnames) == 0 {
 		return []string{}, fmt.Errorf("no hostnames provided")
@@ -299,19 +316,31 @@ func (m *Manager) addRulesIngress(ctx context.Context, ingress *v1ingress.Ingres
 			},
 		}
 
+		// changed tracks whether we actually mutated the ingress. On a
+		// level-triggered re-assert the rule + TLS are already in place, so we
+		// must skip the Update to avoid churning the ingress and forcing nginx
+		// reloads on every reconcile.
+		changed := false
+
 	INGRESS:
 		for _, hostname := range hostnames {
 			for idx, r := range ingress.Spec.Rules {
 				if r.Host != hostname {
 					continue
 				}
+				// Already routes this host to our service+port — nothing to do.
+				if ruleHasBackend(r.IngressRuleValue, service.Name, int32(port)) {
+					continue INGRESS
+				}
 				ingress.Spec.Rules[idx].IngressRuleValue = rule
+				changed = true
 				continue INGRESS
 			}
 			ingress.Spec.Rules = append(ingress.Spec.Rules, v1ingress.IngressRule{
 				Host:             hostname,
 				IngressRuleValue: rule,
 			})
+			changed = true
 		}
 
 		var newHostNames []string
@@ -336,6 +365,12 @@ func (m *Manager) addRulesIngress(ctx context.Context, ingress *v1ingress.Ingres
 					SecretName: fmt.Sprintf("%s-tls", hostname),
 				})
 			}
+			changed = true
+		}
+
+		if !changed {
+			log.Info().Str("ingress", ingress.Name).Msg("portmanager: ingress already up to date")
+			return hostnames, nil
 		}
 
 		log.Info().Str("ingress", ingress.Name).Int("rulesCount", len(ingress.Spec.Rules)).Msg("portmanager: updating ingress")
