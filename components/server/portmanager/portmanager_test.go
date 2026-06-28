@@ -276,6 +276,74 @@ func TestDisclosePort_OnlyRemovesOwnPort(t *testing.T) {
 	}
 }
 
+// TestExposePort_IdempotentReassert verifies the level-triggered self-heal path
+// is cheap: re-asserting an already-exposed port must leave the rule in place
+// AND must not bump the ingress resourceVersion (no no-op Update, so no needless
+// nginx reload) on every reconcile.
+func TestExposePort_IdempotentReassert(t *testing.T) {
+	mgr := setupTestEnv(t, nil, nil, nil)
+	ctx := context.Background()
+	host := []string{"site.example.com"}
+
+	if _, err := mgr.ExposePort(ctx, "", host, 41000); err != nil {
+		t.Fatalf("first ExposePort failed: %v", err)
+	}
+
+	ingress, err := mgr.getReleaseIngress(ctx, testReleaseName)
+	if err != nil {
+		t.Fatalf("getReleaseIngress failed: %v", err)
+	}
+	if !hasIngressRuleForPort(ingress, testServiceName, 41000) {
+		t.Fatal("ingress should have rule for port 41000 after first expose")
+	}
+	rvBefore := ingress.ResourceVersion
+
+	// Re-assert the exact same port + hostname (what reconcile does every cycle).
+	if _, err := mgr.ExposePort(ctx, "", host, 41000); err != nil {
+		t.Fatalf("re-assert ExposePort failed: %v", err)
+	}
+
+	ingress, err = mgr.getReleaseIngress(ctx, testReleaseName)
+	if err != nil {
+		t.Fatalf("getReleaseIngress failed: %v", err)
+	}
+	if !hasIngressRuleForPort(ingress, testServiceName, 41000) {
+		t.Fatal("ingress rule for 41000 must survive the re-assert")
+	}
+	if ingress.ResourceVersion != rvBefore {
+		t.Fatalf("re-assert churned the ingress: resourceVersion %s -> %s (expected no Update)", rvBefore, ingress.ResourceVersion)
+	}
+}
+
+// TestExposePort_ReassertHealsWipedService verifies the self-heal itself: when
+// the Service loses the port out from under us (a helm upgrade resetting it),
+// a re-assert puts it back.
+func TestExposePort_ReassertHealsWipedService(t *testing.T) {
+	mgr := setupTestEnv(t, nil, nil, nil)
+	ctx := context.Background()
+	host := []string{"site.example.com"}
+
+	if _, err := mgr.ExposePort(ctx, "", host, 42000); err != nil {
+		t.Fatalf("first ExposePort failed: %v", err)
+	}
+
+	// Simulate a helm upgrade wiping the disclosed port off the Service.
+	svc, _ := mgr.getReleaseService(ctx, testReleaseName)
+	svc.Spec.Ports = nil
+	if err := mgr.client.Update(ctx, svc); err != nil {
+		t.Fatalf("failed to wipe service ports: %v", err)
+	}
+
+	// Re-assert should restore the port.
+	if _, err := mgr.ExposePort(ctx, "", host, 42000); err != nil {
+		t.Fatalf("re-assert ExposePort failed: %v", err)
+	}
+	svc, _ = mgr.getReleaseService(ctx, testReleaseName)
+	if !hasServicePort(svc, 42000) {
+		t.Fatal("re-assert should have restored port 42000 on the service")
+	}
+}
+
 func hasServicePort(svc *v1core.Service, port int) bool {
 	for _, p := range svc.Spec.Ports {
 		if p.Port == int32(port) {

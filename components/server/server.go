@@ -73,6 +73,11 @@ type Component struct {
 	// ExposePort is safe from any pod (retry-on-conflict handles concurrent writes).
 	isLeader atomic.Bool
 
+	// reasserting guards the level-triggered re-disclose goroutine so a burst of
+	// reconciles can't pile up concurrent ExposePort calls. Only one re-assert
+	// runs at a time; reconciles arriving while one is in flight are skipped.
+	reasserting atomic.Bool
+
 	// serverDone is closed when the server stops, allowing waiters to unblock
 	serverDone     chan struct{}
 	serverDoneLock *sync.Mutex
@@ -317,6 +322,24 @@ func (h *Component) handleReconcile(node v1alpha1.TinyNode) {
 			log.Info().Msg("http_server: start metadata cleared, stopping running server")
 			_ = h.stop()
 			return
+		}
+
+		// Level-triggered re-disclose. The listener is up, but the shared manager
+		// Service/Ingress can be reset out from under us WITHOUT restarting this
+		// pod: a same-version module re-install runs `helm upgrade`, which
+		// replaces the Service back to grpc-only and wipes our exposed port.
+		// Nothing re-binds (the listener is fine), so the site goes 503 silently
+		// until something restarts the pod. Re-assert the disclosure on every
+		// reconcile so a wiped Service/Ingress self-heals within one cycle.
+		// ExposePort is idempotent — a no-op read when the port + rule already
+		// exist — so this costs nothing in the healthy case. Leader-only because
+		// it mutates shared cluster resources; the guard keeps reconcile storms
+		// from spawning overlapping goroutines.
+		if h.isLeader.Load() && h.reasserting.CompareAndSwap(false, true) {
+			go func(port int) {
+				defer h.reasserting.Store(false)
+				h.exposePort(context.Background(), port)
+			}(metadataPort)
 		}
 		return
 	}
