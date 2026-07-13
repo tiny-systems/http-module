@@ -158,6 +158,16 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	}
 }
 
+// SyncRPC declares the transport fact about this component: it emits a
+// request and BLOCKS holding a live HTTP connection until the response
+// port receives the result. Nodes on its request→response path must be
+// delivered over classic request/reply (which load-balances across the
+// module's pods), never durable fire-and-forget — a persisted hop
+// returns nothing to a waiting caller.
+func (h *Component) SyncRPC() module.SyncRPCInfo {
+	return module.SyncRPCInfo{}
+}
+
 // State management
 
 func (h *Component) stop() error {
