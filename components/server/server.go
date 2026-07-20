@@ -34,6 +34,7 @@ const (
 	ResponsePort         = "response"
 	RequestPort          = "request"
 	StartPort            = "start"
+	StopPort             = "stop"
 	StatusPort           = "status"
 
 	metadataKeyStart = "http-start"
@@ -95,12 +96,14 @@ func (h *Component) Instance() module.Component {
 		},
 		settings: Settings{
 			EnableStatusPort: false,
+			EnableStopPort:   false,
 		},
 	}
 }
 
 type Settings struct {
 	EnableStatusPort bool `json:"enableStatusPort" required:"true" title:"Enable status port" description:"Status port notifies when server is up or down"`
+	EnableStopPort   bool `json:"enableStopPort" required:"true" title:"Enable stop port" description:"Stop port stops the running server when it receives any message"`
 	MaxBodySize      int  `json:"maxBodySize" title:"Max Body Size (MB)" description:"Maximum request body size in megabytes. 0 means use default (10MB)."`
 }
 
@@ -116,6 +119,13 @@ type Start struct {
 	WriteTimeout int          `json:"writeTimeout" required:"true" title:"Write Timeout" description:"Write timeout is the maximum duration before timing out writes of the response in seconds. It is reset whenever a new request's header is read."`
 	TLSCert      string       `json:"tlsCert,omitempty" title:"TLS Certificate" description:"PEM or base64-encoded PEM certificate for HTTPS. Leave empty for plain HTTP." format:"textarea"`
 	TLSKey       string       `json:"tlsKey,omitempty" title:"TLS Private Key" description:"PEM or base64-encoded PEM private key for HTTPS. Leave empty for plain HTTP." format:"textarea"`
+}
+
+// Stop is the Stop port's payload. Any message stops the running server; the
+// Context field exists only so the port carries a schema and can be fed from
+// upstream data. Gated by Settings.EnableStopPort.
+type Stop struct {
+	Context StartContext `json:"context,omitempty" configurable:"true" title:"Context" description:"Ignored — any message on this port stops the server"`
 }
 
 type Request struct {
@@ -153,7 +163,7 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "HTTP Server",
-		Info:        "HTTP request handler. The server does NOT run until a message arrives on the Start port — wire a signal (or cron) into Start to launch it (a cron would re-launch on every tick, so prefer signal for a long-running server). On start it exposes a public URL; read that URL from the _control port's ListenAddr (or enable the status port) — never guess the address. Each incoming HTTP request emits on Request port. Wire Request to processing logic, then wire result to Response port with statusCode (required), contentType (required), headers, body.",
+		Info:        "HTTP request handler. The server does NOT run until a message arrives on the Start port — wire a signal (or cron) into Start to launch it (a cron would re-launch on every tick, so prefer signal for a long-running server). On start it exposes a public URL; read that URL from the _control port's ListenAddr (or enable the status port) — never guess the address. Each incoming HTTP request emits on Request port. Wire Request to processing logic, then wire result to Response port with statusCode (required), contentType (required), headers, body. To stop the server, enable the Stop port in settings and send it any message (context cancellation alone will NOT stop it — the runtime is distributed and durable).",
 		Tags:        []string{"HTTP", "Server"},
 	}
 }
@@ -275,11 +285,29 @@ func (h *Component) Handle(ctx context.Context, handler module.Handler, port str
 			return module.Fail(err)
 		}
 		return module.Result{}
+	case StopPort:
+		if err := h.handleStop(); err != nil {
+			return module.Fail(err)
+		}
+		return module.Result{}
 	case ResponsePort:
 		return h.handleResponse(msg)
 	default:
 		return module.Fail(fmt.Errorf("port %s is not supported", port))
 	}
+}
+
+// handleStop is the explicit stop the distributed runtime needs: cross-pod
+// context cancellation doesn't exist, so a running server can only be told to
+// stop by a message. Any payload on the Stop port lands here. It clears the
+// start intent FIRST — otherwise the durable reconcile path (handleReconcile)
+// re-hosts the server the instant we cancel it — then cancels the server. The
+// cancellation's own shutdown clears the listen address and flips _control to
+// "Not running", which is also what makes a localhost tunnel or ingress drop.
+func (h *Component) handleStop() error {
+	log.Info().Msg("http_server: Stop port received, stopping server")
+	h.clearStartMetadata()
+	return h.stop()
 }
 
 func (h *Component) handleResponse(msg interface{}) module.Result {
@@ -980,6 +1008,15 @@ func (h *Component) Ports() []module.Port {
 			Position:      module.Left,
 			Configuration: h.startSettings,
 		},
+	}
+
+	if h.settings.EnableStopPort {
+		ports = append(ports, module.Port{
+			Position:      module.Left,
+			Name:          StopPort,
+			Label:         "Stop",
+			Configuration: Stop{},
+		})
 	}
 
 	if h.settings.EnableStatusPort {
