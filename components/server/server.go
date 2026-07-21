@@ -74,6 +74,11 @@ type Component struct {
 	// ExposePort is safe from any pod (retry-on-conflict handles concurrent writes).
 	isLeader atomic.Bool
 
+	// noPublicHostLogged de-dupes the "no public hostname on this cluster"
+	// notice so it's logged once, not on every 15s reassert. Reset when a
+	// public URL does appear so a later regression logs again.
+	noPublicHostLogged atomic.Bool
+
 	// serverDone is closed when the server stops, allowing waiters to unblock
 	serverDone     chan struct{}
 	serverDoneLock *sync.Mutex
@@ -881,11 +886,24 @@ func (h *Component) exposePort(ctx context.Context, port int) []string {
 		return []string{fmt.Sprintf("http://localhost:%d", port)}
 	}
 
-	log.Info().Int("port", port).Strs("publicURLs", publicURLs).Msg("http-server: port exposed successfully")
-
-	// Update last exposed port after successful expose
+	// The service port is exposed either way; record it so a later port change
+	// can disclose the old one.
 	h.setLastExposedPort(port)
 
+	if len(publicURLs) == 0 {
+		// No public hostname on this cluster: the ingress has no auto-subdomain
+		// annotation and the node set no explicit hostnames. The server still
+		// serves on its service port and is reachable via tiny's tunnel /
+		// port-forward. Report the local address so _control's ListenAddr has
+		// something to follow, and log it once instead of on every 15s reassert.
+		if !h.noPublicHostLogged.Swap(true) {
+			log.Info().Int("port", port).Msg("http-server: no public hostname on this cluster (no ingress subdomain) — serving on service port, reachable via tunnel/port-forward")
+		}
+		return []string{fmt.Sprintf("http://localhost:%d", port)}
+	}
+
+	h.noPublicHostLogged.Store(false)
+	log.Info().Int("port", port).Strs("publicURLs", publicURLs).Msg("http-server: port exposed successfully")
 	return publicURLs
 }
 

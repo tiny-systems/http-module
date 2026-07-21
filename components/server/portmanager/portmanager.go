@@ -75,6 +75,18 @@ func (m *Manager) ExposePort(ctx context.Context, autoHostName string, hostnames
 		hostnames = append(hostnames, fmt.Sprintf("%s-%s", autoHostName, prefix))
 	}
 
+	if len(hostnames) == 0 {
+		// The service port is exposed (reachable in-cluster and through tiny's
+		// tunnel / port-forward), but this cluster's ingress carries no
+		// auto-subdomain annotation and the node configured no explicit
+		// hostnames — so there is no public hostname to route. That is a valid
+		// state, not a failure: return no public URLs rather than erroring, so
+		// the caller doesn't retry-loop forever trying to add an ingress rule it
+		// can never build. Platform-provisioned clusters set the annotation
+		// (IngressHostNameSuffixAnnotation) and take the branch above.
+		return []string{}, nil
+	}
+
 	return m.addRulesIngress(ctx, ingress, svc, hostnames, port)
 }
 
