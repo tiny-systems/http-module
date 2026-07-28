@@ -48,3 +48,15 @@ Key points:
 - Use `type Context any` not just `any` directly - this enables proper schema generation
 - Add `configurable:"true"` to Context fields on both input AND output ports
 - Error structs should only have Context and Error message, not duplicate the entire Request
+
+## CRITICAL: Handler Results + the SyncRPC Capability
+
+**NEVER ignore the return value of handler() calls — ALWAYS `return handler(ctx, port, data)`.** Request-response subgraphs run blocking I/O: an upstream component (http_server holding its live socket) blocks until the response flows back through the handler chain; a dropped return loses the response and times out the caller. The rule applies in durable subgraphs too — the returned `Result` drives ack/retry.
+
+If a component itself **blocks holding a live connection** (emits on a source port and waits for the chain to deliver a result back within the same request), it MUST declare the capability:
+
+```go
+func (c *Component) SyncRPC() module.SyncRPCInfo { return module.SyncRPCInfo{} }
+```
+
+`module build` auto-tags it `sync_rpc`; the platform keeps that component's subgraph on blocking request/reply while trigger-driven subgraphs run durable fire-and-forget — modes are derived, never configured. Forgetting the declaration is fatal: durable hops return nothing to their sender, so the awaited response never arrives. Canonical implementer: `http_server` (live socket). Components that merely sit in its subgraph — a Slack command handler, a router — declare nothing; they inherit classic delivery automatically.
