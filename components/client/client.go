@@ -60,9 +60,10 @@ type ResponseResponse struct {
 }
 
 type Error struct {
-	Context  Context          `json:"context" configurable:"true" required:"true" title:"Context" description:"Message to be sent further"`
-	Response ResponseResponse `json:"response"`
-	Error    string           `json:"error" required:"true"`
+	Context   Context          `json:"context" configurable:"true" required:"true" title:"Context" description:"Message to be sent further"`
+	Error     string           `json:"error" required:"true"`
+	Retryable bool             `json:"retryable" title:"Retryable" description:"True for network failures, 429 (rate limit), and 5xx responses — wire the error port into the retry component to retry these with backoff. False for 4xx (client errors won't get better on retry)."`
+	Response  ResponseResponse `json:"response"`
 }
 
 type Component struct {
@@ -181,10 +182,16 @@ func (h *Component) handleError(ctx context.Context, handler module.Handler, req
 	if !h.settings.EnableErrorPort {
 		return module.Fail(err)
 	}
+	// Classify for the retry component: a 0 status means the request never got
+	// a response (DNS/dial/timeout — transient); 429 and 5xx are the server
+	// asking (or failing) in a way a backoff retry can clear. 4xx is the
+	// caller's fault and won't improve on retry.
+	retryable := resp.StatusCode == 0 || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 	return handler(ctx, ErrorPort, Error{
-		Context:  reqContext,
-		Error:    err.Error(),
-		Response: resp,
+		Context:   reqContext,
+		Error:     err.Error(),
+		Retryable: retryable,
+		Response:  resp,
 	})
 }
 
