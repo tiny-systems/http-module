@@ -126,13 +126,14 @@ func (h *Component) doRequest(ctx context.Context, handler module.Handler, in Re
 
 	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
-		return h.handleError(ctx, handler, in.Context, err, ResponseResponse{})
+		// The request never got a response (DNS/dial/timeout) — transient.
+		return h.handleError(ctx, handler, in.Context, module.Retryable(err), ResponseResponse{})
 	}
 	defer resp.Body.Close()
 
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return h.handleError(ctx, handler, in.Context, err, ResponseResponse{})
+		return h.handleError(ctx, handler, in.Context, module.Retryable(err), ResponseResponse{})
 	}
 
 	body := string(b)
@@ -169,7 +170,13 @@ func (h *Component) doRequest(ctx context.Context, handler module.Handler, in Re
 	}
 
 	if resp.StatusCode >= 400 {
-		return h.handleError(ctx, handler, in.Context, fmt.Errorf("%s", body), respData)
+		statusErr := fmt.Errorf("%s", body)
+		// 429 and 5xx are the server asking (or failing) in a way a backoff
+		// retry can clear; 4xx is the caller's fault and won't improve.
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			statusErr = module.Retryable(statusErr)
+		}
+		return h.handleError(ctx, handler, in.Context, statusErr, respData)
 	}
 
 	return handler(ctx, ResponsePort, Response{
@@ -180,17 +187,20 @@ func (h *Component) doRequest(ctx context.Context, handler module.Handler, in Re
 
 func (h *Component) handleError(ctx context.Context, handler module.Handler, reqContext Context, err error, resp ResponseResponse) module.Result {
 	if !h.settings.EnableErrorPort {
+		// Bubble the error unchanged — its retryability (marked by the caller
+		// with module.Retryable) rides along through Result.Err so an upstream
+		// error port sees it.
 		return module.Fail(err)
 	}
-	// Classify for the retry component: a 0 status means the request never got
-	// a response (DNS/dial/timeout — transient); 429 and 5xx are the server
-	// asking (or failing) in a way a backoff retry can clear. 4xx is the
-	// caller's fault and won't improve on retry.
-	retryable := resp.StatusCode == 0 || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+	// Retryability is the error's own property now (module.Retryable at the
+	// transient branches above); read it back with module.IsRetryable rather
+	// than re-deriving from the status here. Error carries a full Response too,
+	// so it keeps its own struct instead of module.ErrorMessage — but the
+	// {context, error, retryable} shape matches the canonical contract.
 	return handler(ctx, ErrorPort, Error{
 		Context:   reqContext,
 		Error:     err.Error(),
-		Retryable: retryable,
+		Retryable: module.IsRetryable(err),
 		Response:  resp,
 	})
 }
