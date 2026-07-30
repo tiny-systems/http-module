@@ -8,6 +8,8 @@ import (
 	"github.com/spf13/viper"
 	_ "github.com/tiny-systems/http-module/components/basicauth/header-parser"
 	_ "github.com/tiny-systems/http-module/components/client"
+	_ "github.com/tiny-systems/http-module/components/logql"
+	_ "github.com/tiny-systems/http-module/components/promql"
 	_ "github.com/tiny-systems/http-module/components/server"
 	"github.com/tiny-systems/module/cli"
 	"github.com/tiny-systems/module/module"
