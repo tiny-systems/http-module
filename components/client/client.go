@@ -21,20 +21,28 @@ const (
 	ErrorPort     = "error"
 )
 
+// defaultMaxResponseBytes bounds the response read. An unbounded ReadAll of a
+// hostile or misconfigured endpoint would OOM the pod.
+const defaultMaxResponseBytes = 10 * 1024 * 1024
+
 type Context any
 
 type Settings struct {
-	EnableErrorPort bool `json:"enableErrorPort" required:"true" title:"Enable Error Port" description:"If request fail, error port will emit an error message. HTTP responses with status code >= 400 will emit an error message."`
+	EnableErrorPort  bool `json:"enableErrorPort" required:"true" title:"Enable Error Port" description:"If request fail, error port will emit an error message. HTTP responses with status code >= 400 will emit an error message."`
+	MaxResponseBytes int  `json:"maxResponseBytes" title:"Max Response Bytes" description:"Cap on response body size; larger responses fail rather than OOM the pod. Defaults to 10485760 (10MB)."`
 }
 
 type Request struct {
-	Context     Context         `json:"context,omitempty" configurable:"true" title:"Context" description:"Message to be sent further"`
-	Method      string          `json:"method" required:"true" title:"Method" enum:"GET,POST,PATCH,PUT,DELETE" enumTitles:"GET,POST,PATCH,PUT,DELETE" colSpan:"col-span-6"`
-	Timeout     int             `json:"timeout" required:"true" title:"Request Timeout" colSpan:"col-span-6"`
-	URL         string          `json:"url" required:"true" title:"URL" format:"uri"`
-	Headers     []etc.Header    `json:"headers,omitempty" title:"Headers"`
-	ContentType etc.ContentType `json:"contentType" title:"Request Content Type" required:"true"`
-	Body        string          `json:"body" title:"Request Body" format:"textarea"`
+	Context           Context         `json:"context,omitempty" configurable:"true" title:"Context" description:"Message to be sent further"`
+	Method            string          `json:"method" required:"true" title:"Method" enum:"GET,POST,PATCH,PUT,DELETE" enumTitles:"GET,POST,PATCH,PUT,DELETE" colSpan:"col-span-6"`
+	Timeout           int             `json:"timeout" required:"true" title:"Request Timeout" colSpan:"col-span-6"`
+	URL               string          `json:"url" required:"true" title:"URL" format:"uri"`
+	BearerToken       string          `json:"bearerToken,omitempty" format:"password" title:"Bearer Token" description:"Sets the Authorization: Bearer header. Wins over basic auth if both are set; an explicit Authorization header below overrides either."`
+	BasicAuthUser     string          `json:"basicAuthUser,omitempty" title:"Basic Auth User" colSpan:"col-span-6"`
+	BasicAuthPassword string          `json:"basicAuthPassword,omitempty" format:"password" title:"Basic Auth Password" colSpan:"col-span-6"`
+	Headers           []etc.Header    `json:"headers,omitempty" title:"Headers"`
+	ContentType       etc.ContentType `json:"contentType" title:"Request Content Type" required:"true"`
+	Body              string          `json:"body" title:"Request Body" format:"textarea"`
 }
 
 type Response struct {
@@ -72,7 +80,7 @@ type Component struct {
 
 func (h *Component) Instance() module.Component {
 	return &Component{
-		Settings{},
+		Settings{MaxResponseBytes: defaultMaxResponseBytes},
 	}
 }
 
@@ -80,7 +88,7 @@ func (h *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "HTTP Client",
-		Info:        "Outbound HTTP request maker. Request port receives: context, method, timeout, URL, headers, contentType, body. Blocks until HTTP response received. On success (status < 400): emits context + response on Response port. On failure or status >= 400: returns error, or if enableErrorPort=true in settings, emits on Error port instead.",
+		Info:        "Outbound HTTP request maker. Request port receives: context, method, timeout, URL, bearerToken, basicAuthUser/basicAuthPassword, headers, contentType, body. Auth fields set the Authorization header (bearer wins over basic; an explicit Authorization header overrides both). Blocks until HTTP response received. Response bodies are capped by maxResponseBytes in settings (default 10MB); larger responses fail rather than OOM the pod. On success (status < 400): emits context + response on Response port. On failure or status >= 400: returns error, or if enableErrorPort=true in settings, emits on Error port instead.",
 		Tags:        []string{"HTTP", "Client"},
 	}
 }
@@ -120,6 +128,15 @@ func (h *Component) doRequest(ctx context.Context, handler module.Handler, in Re
 		req.Header.Set("Content-Type", string(in.ContentType))
 	}
 
+	// Auth fields go first so an explicit Authorization header from the
+	// headers array below still overrides them. Bearer wins if both are set.
+	switch {
+	case in.BearerToken != "":
+		req.Header.Set("Authorization", "Bearer "+in.BearerToken)
+	case in.BasicAuthUser != "" || in.BasicAuthPassword != "":
+		req.SetBasicAuth(in.BasicAuthUser, in.BasicAuthPassword)
+	}
+
 	for _, header := range in.Headers {
 		req.Header.Set(header.Key, header.Value)
 	}
@@ -131,9 +148,19 @@ func (h *Component) doRequest(ctx context.Context, handler module.Handler, in Re
 	}
 	defer resp.Body.Close()
 
-	b, err := io.ReadAll(resp.Body)
+	maxBytes := int64(h.settings.MaxResponseBytes)
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxResponseBytes
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
 		return h.handleError(ctx, handler, in.Context, module.Retryable(err), ResponseResponse{})
+	}
+	if int64(len(b)) > maxBytes {
+		// Deliberately not retryable: the same response will be just as big
+		// next time. Raise maxResponseBytes in settings if it is expected.
+		return h.handleError(ctx, handler, in.Context,
+			fmt.Errorf("response body exceeds the %d byte cap (maxResponseBytes setting)", maxBytes), ResponseResponse{})
 	}
 
 	body := string(b)

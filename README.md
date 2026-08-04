@@ -9,7 +9,6 @@ HTTP server and client components for building web-facing automations.
 | HTTP Server | Embedded HTTP server with configurable routes and TLS support |
 | HTTP Client | Make outbound HTTP requests with full header and body control |
 | Basic Auth Parser | Parse and validate HTTP Basic Authentication headers |
-| OpenAPI Request | Make HTTP calls driven by an OpenAPI/Swagger specification |
 | PromQL Query | Run a PromQL query against any Prometheus-compatible API and get the matching series with their labels. Set a range for a trend rather than a single number. |
 | LogQL Query | Search Loki for log lines across every pod at once, each carrying its stream labels. |
 
